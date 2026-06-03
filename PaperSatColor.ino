@@ -78,6 +78,9 @@ int passCount = 0;
 
 unsigned long lastUpdate = 0;
 
+// One-shot: becomes true once we've persisted an NTP-synced clock to the RTC.
+bool rtcSyncedFromNtp = false;
+
 // Threshold for considering time(nullptr) valid (post 2021 to detect unset NTP time)
 const time_t TLE_TIME_VALID_THRESHOLD = 1609459200LL; // 2021-01-01 UTC
 
@@ -112,6 +115,8 @@ void saveConfig();
 void loadConfig();
 void updateData();
 bool autoLocateViaWiFi();
+void writeSystemClockToRtc();
+bool syncSystemClockFromRtc();
 
 // ====================== HELPER ======================
 void drawDegreeSymbol(int16_t x, int16_t y) {
@@ -137,7 +142,39 @@ void setSystemTime(int year, int mon, int day, int hour, int min, int sec) {
     tv.tv_sec = epoch;
     tv.tv_usec = 0;
     settimeofday(&tv, NULL);
+    writeSystemClockToRtc();   // persist across power loss
   }
+}
+
+// ====================== REAL-TIME CLOCK (RX8130CE) ======================
+// The board has a battery-backed RTC. We use it so the tracker has a valid UTC
+// clock the instant it powers on, even with no Wi-Fi, and so manually entered or
+// NTP-synced time survives a full power-off. All RTC values are kept in UTC, to
+// match NTP (configTime offset 0) and the UTC-labeled displays.
+
+// Write the current ESP32 system clock into the RTC (call after NTP or manual set).
+void writeSystemClockToRtc() {
+  if (!M5.Rtc.isEnabled()) return;
+  time_t now = time(nullptr);
+  if (now < TLE_TIME_VALID_THRESHOLD) return;  // don't store an unset clock
+  M5.Rtc.setDateTime(gmtime(&now));
+}
+
+// Seed the ESP32 system clock from the RTC at boot. Returns true if the RTC held
+// a plausible time (year >= 2021) and the system clock was set from it.
+bool syncSystemClockFromRtc() {
+  if (!M5.Rtc.isEnabled()) return false;
+  auto dt = M5.Rtc.getDateTime();
+  if (dt.date.year < 2021) return false;       // RTC never set / lost power
+  struct tm t = dt.get_tm();
+  t.tm_isdst = 0;
+  time_t epoch = mktime(&t);                    // tm is UTC (ESP32 default TZ)
+  if (epoch == (time_t)-1) return false;
+  struct timeval tv;
+  tv.tv_sec = epoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, NULL);
+  return true;
 }
 
 // ====================== MAIDENHEAD ======================
@@ -1236,6 +1273,13 @@ void setup() {
   }
 
   loadConfig();
+
+  // Seed the system clock from the battery-backed RTC so time is valid before we
+  // run any orbital math, even with no network yet. NTP (below) will refine it.
+  if (syncSystemClockFromRtc()) {
+    statusMsg = "Time from RTC";
+  }
+
   WiFi.begin();
   configTime(0, 0, "pool.ntp.org");
 
@@ -1247,6 +1291,14 @@ void setup() {
 void loop() {
   M5.update();
   handleButtons();
+
+  // Once NTP has set a valid clock, persist it to the RTC a single time so the
+  // good time survives power-off. (NTP completes asynchronously after boot.)
+  if (!rtcSyncedFromNtp && WiFi.status() == WL_CONNECTED &&
+      time(nullptr) > TLE_TIME_VALID_THRESHOLD) {
+    writeSystemClockToRtc();
+    rtcSyncedFromNtp = true;
+  }
 
   if (currentScreen == MAIN) {
     // Spectra 6 full refreshes are slow (~15-19s) and flash the whole panel, so

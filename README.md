@@ -11,7 +11,7 @@ This is a port of the original PaperSat (built for the monochrome, touchscreen M
 - **Color status cues** made possible by the SPECTRA 6 panel: the satellite marker and its name turn red while it is above the horizon, and the plotted pass arc is drawn in blue.
 - **Orbital data over Wi-Fi** from the AMSAT daily bulletin, rebuilt into SGP4 elements on-device, with an offline cache so the tracker keeps working without a connection.
 - **Flexible location entry**: Maidenhead grid square, raw latitude/longitude, or automatic geolocation from your public IP.
-- **Time sync** via NTP, with a manual UTC entry fallback.
+- **Time sync** via NTP, backed by the on-board battery RTC so the clock is correct the moment the device powers on — even offline — with a manual UTC entry fallback.
 
 ## Hardware
 
@@ -56,6 +56,8 @@ Long-pressing **B** at any time cancels and returns to the setup menu.
 
 On boot the app connects to saved Wi-Fi, syncs time over NTP, and downloads the AMSAT daily bulletin (`daily-bulletin.json`). For the selected satellite it reconstructs standard two-line elements from the bulletin's discrete orbital-element fields and feeds them to the SGP4 propagator. The bulletin is cached to the on-board flash (LittleFS) so the tracker continues to work offline using the last known elements. Your location, selected satellite, and cached elements are persisted in non-volatile storage and survive reboots.
 
+Time is kept in UTC and backed by the board's battery-powered real-time clock (RX8130CE). At startup the system clock is seeded from the RTC, so pass predictions are valid immediately even with no network. When NTP later provides a more accurate time — or when you set the time manually — that value is written back to the RTC, so the correct time persists through a full power-off and is available on the next cold boot.
+
 The bulletin is refreshed roughly once a day (or on demand from *Sat List → Update GP*). On the main screen the position and pass list update about once a minute while a pass is in progress and about every five minutes otherwise — deliberately infrequent, because color e-paper takes roughly 15–19 seconds to perform its full-screen refresh and flashes while doing so. Button presses are always handled immediately.
 
 ## Building
@@ -95,7 +97,7 @@ Connect the board over USB-C and flash from the Arduino IDE (or `pio run -t uplo
 | Location | 38.8626, −77.0562 (Washington, DC area) |
 | Satellite | ISS (NORAD 25544) |
 | Orbital data source | AMSAT daily bulletin |
-| Time base | UTC (NTP via `pool.ntp.org`) |
+| Time base | UTC (NTP via `pool.ntp.org`, RTC-backed) |
 
 These can all be changed at runtime from the Setup and Sat List screens; your choices are saved automatically.
 
@@ -104,7 +106,6 @@ These can all be changed at runtime from the Setup and Sat List screens; your ch
 - **Color e-paper is slow.** Expect a full-screen flash of roughly 15–19 seconds on each redraw. This is normal for SPECTRA 6 panels and is why the interface avoids frequent updates.
 - **Pass times are in UTC.**
 - The battery percentage assumes a single-cell LiPo (3.4 V empty, 4.2 V full); if your board's power reading differs, the percentage may need calibration.
-- An on-board real-time clock (RX8130CE) is present on this hardware but is not yet used; time currently comes from NTP or manual entry.
 
 ## Credits
 

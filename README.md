@@ -18,6 +18,7 @@ Color SPECTRA 6 e-paper takes roughly 15–19 seconds to refresh and **cannot do
 - **Wi-Fi-only configuration**: a built-in web page with four dropdowns populated from the AMSAT bulletin satellite list, plus station location fields (lat/lon, altitude, or a Maidenhead grid).
 - **Orbital data over Wi-Fi** from the AMSAT daily bulletin, rebuilt into SGP4 elements on-device, with an offline LittleFS cache so passes keep computing without a connection.
 - **RTC-backed UTC clock** (RX8130CE), so the time is correct immediately on power-up even before Wi-Fi connects.
+- **Pass alerts (LED + sound).** The two onboard RGB LEDs flash and the speaker plays a short tone at four moments around every tracked pass: 5 minutes before AOS, 1 minute before AOS, at AOS (rise), and at LOS (set). Each moment has a distinct color and tone so you can tell them apart without looking: amber double-beep at T-5, orange triple-beep at T-1, a green rising two-tone at AOS, and a red falling two-tone at LOS. Each alert fires once per pass, and all four satellites are watched independently.
 
 ## Hardware
 
@@ -79,8 +80,11 @@ Install through the Arduino Library Manager (or PlatformIO `lib_deps`):
 - **WiFiManager** (tzapu) — captive-portal Wi-Fi credential setup.
 - **ArduinoJson** (Benoit Blanchon) — parsing the AMSAT bulletin.
 - **Sgp4** — the SGP4 orbital propagator (Hopkins' Arduino port).
+- **FastLED** — drives the two onboard RGB LEDs for pass alerts (M5Unified does not control the RGB LEDs itself).
 
 `WiFi`, `WebServer`, `HTTPClient`, `Preferences`, and `LittleFS` ship with the ESP32 core.
+
+> **LED data pin:** the sketch defines `LED_DATA_PIN` near the top (default 21). RGB-LED wiring varies between board revisions, so check this against your unit's GPIO map. If it's wrong, only the LED alerts are affected — the tones and the rest of the app still work.
 
 ### Flashing
 

@@ -30,6 +30,7 @@
 #include <math.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>  // "ArduinoJson" by Benoit Blanchon
+#include <FastLED.h>      // RGB LEDs (M5Unified does not drive them)
 
 // ====================== DISPLAY ======================
 #define SCR_W 400
@@ -68,6 +69,29 @@ double qth_alt = 10.0;
 #define NUM_TRACKED 4     // 2x2 grid
 #define ARC_POINTS  24    // polar arc samples per pass
 
+// ---------------- Alerts (LED + sound) ----------------
+// The device flashes its two RGB LEDs and plays a tone at four moments around
+// every tracked pass: 5 minutes before AOS, 1 minute before AOS, at AOS (rise),
+// and at LOS (set). Each alert fires exactly once per pass.
+//
+// LEDs use FastLED (M5Unified doesn't drive them). VERIFY the data pin against
+// the M5Paper Color GPIO map - this is the documented default but boards vary.
+#define LED_DATA_PIN  21      // <-- confirm on your unit's pinout
+#define NUM_LEDS      2
+#define LED_BRIGHTNESS 40     // 0-255; keep modest (heat) and battery-friendly
+CRGB leds[NUM_LEDS];
+bool ledsReady = false;
+
+// Sound uses the built-in speaker (ES8311 codec + AW8737A amp) via M5.Speaker.
+#define ALERT_VOLUME  150     // 0-255
+
+// The four alert offsets relative to AOS (LOS handled separately).
+#define ALERT_T5_SEC  (5*60)
+#define ALERT_T1_SEC  (1*60)
+
+// Per-pass alert kinds.
+enum AlertKind { AL_T5 = 0, AL_T1 = 1, AL_AOS = 2, AL_LOS = 3, AL_COUNT = 4 };
+
 Sgp4 sat;                 // single reused propagator (re-init per satellite)
 Preferences prefs;
 WebServer server(80);     // config web UI
@@ -93,6 +117,7 @@ struct TrackedSat {
   int    arcN;
   float  arcAz[ARC_POINTS];
   float  arcEl[ARC_POINTS];
+  bool   alerted[AL_COUNT];   // which alerts have fired for the current pass
 };
 TrackedSat tracked[NUM_TRACKED];
 
@@ -118,6 +143,8 @@ void   loadConfig();
 bool   fetchBulletin();
 bool   parseGPJson(const String& payload, bool buildTrackedTLEs);
 void   recomputeAllPasses();
+void   checkAlerts();
+void   fireAlert(AlertKind k, const char* satName);
 void   computeNextPass(int idx);
 bool   autoLocateViaWiFi();
 void   writeSystemClockToRtc();
@@ -469,6 +496,7 @@ bool fetchBulletin() {
 void computeNextPass(int idx) {
   TrackedSat &T = tracked[idx];
   T.hasPass = false; T.arcN = 0;
+  for (int a = 0; a < AL_COUNT; a++) T.alerted[a] = false;  // new pass -> re-arm alerts
   if (!T.haveTLE) return;
 
   sat.init(T.name, T.tle1, T.tle2);
@@ -523,11 +551,107 @@ void computeNextPass(int idx) {
 void recomputeAllPasses() {
   for (int i = 0; i < NUM_TRACKED; i++) computeNextPass(i);
   time_t now = time(nullptr);
+  // Schedule the next screen recompute for the soonest pass END (LOS) in the
+  // future. We deliberately key the redraw off LOS, not AOS: at AOS the shown
+  // pass is the one in progress and should stay on screen; only once it ends do
+  // we roll every cell forward to its next pass. (The T-5/T-1/AOS moments are
+  // handled by checkAlerts(), independently of the redraw schedule.) A small
+  // margin past LOS avoids re-finding the same pass.
   nextEventTime = 0;
   for (int i = 0; i < NUM_TRACKED; i++) {
     if (!tracked[i].hasPass) continue;
-    time_t evt = (tracked[i].aos > now) ? tracked[i].aos : tracked[i].los;
+    time_t evt = tracked[i].los + 5;
     if (evt > now && (nextEventTime == 0 || evt < nextEventTime)) nextEventTime = evt;
+  }
+}
+
+// ====================== ALERTS (LED + SOUND) ======================
+// Each alert is a short, distinct LED color + tone pattern so you can tell which
+// of the four moments fired without looking at the screen:
+//   T-5 min : amber,  two low beeps
+//   T-1 min : orange, three mid beeps
+//   AOS     : green,  rising two-tone (it's up!)
+//   LOS     : red,    falling two-tone (it's gone)
+// The LED flash and tones are brief and non-blocking-ish (tone() runs in the
+// background; we use short delays only for the multi-blink/beep cadence).
+
+static void ledFill(const CRGB& c) {
+  if (!ledsReady) return;
+  for (int i = 0; i < NUM_LEDS; i++) leds[i] = c;
+  FastLED.show();
+}
+
+static void beep(float freq, uint32_t ms) {
+  M5.Speaker.tone(freq, ms);
+  // tone() is asynchronous; wait out its duration so sequential beeps are distinct.
+  uint32_t t0 = millis();
+  while (M5.Speaker.isPlaying() && millis() - t0 < ms + 50) { delay(5); }
+}
+
+// Flash the LEDs `blinks` times in color `c`, each on for `onMs`.
+static void ledBlink(const CRGB& c, int blinks, int onMs) {
+  if (!ledsReady) return;
+  for (int b = 0; b < blinks; b++) {
+    ledFill(c);
+    delay(onMs);
+    ledFill(CRGB::Black);
+    if (b < blinks - 1) delay(onMs / 2);
+  }
+}
+
+// Fire one alert: distinct color + tone signature per kind. LED and sound run
+// together (LED blink provides the inter-beep gaps).
+void fireAlert(AlertKind k, const char* satName) {
+  M5.Speaker.setVolume(ALERT_VOLUME);
+  switch (k) {
+    case AL_T5:   // 5 minutes out: amber, two low beeps
+      M5.Speaker.tone(660, 180); ledBlink(CRGB(255, 120, 0), 1, 180);
+      M5.Speaker.tone(660, 180); ledBlink(CRGB(255, 120, 0), 1, 180);
+      break;
+    case AL_T1:   // 1 minute out: orange, three mid beeps
+      for (int i = 0; i < 3; i++) { M5.Speaker.tone(880, 150); ledBlink(CRGB(255, 70, 0), 1, 150); }
+      break;
+    case AL_AOS:  // rise: green, rising two-tone
+      M5.Speaker.tone(880, 200);  ledBlink(CRGB::Green, 1, 200);
+      M5.Speaker.tone(1320, 350); ledBlink(CRGB::Green, 1, 350);
+      break;
+    case AL_LOS:  // set: red, falling two-tone
+      M5.Speaker.tone(1320, 200); ledBlink(CRGB::Red, 1, 200);
+      M5.Speaker.tone(660, 350);  ledBlink(CRGB::Red, 1, 350);
+      break;
+    default: break;
+  }
+  ledFill(CRGB::Black);
+}
+
+// Poll all tracked passes and fire any alert whose moment has arrived (once
+// each). Called every loop. Uses a small look-back window so a brief scheduling
+// delay (e.g. during a slow EPD refresh) still fires the alert rather than
+// skipping it. Alerts more than 30s late are treated as missed and skipped.
+void checkAlerts() {
+  time_t now = time(nullptr);
+  if (now < TLE_TIME_VALID_THRESHOLD) return;   // clock not set yet
+
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    TrackedSat &T = tracked[i];
+    if (!T.hasPass) continue;
+
+    struct { AlertKind k; time_t when; } pts[AL_COUNT] = {
+      { AL_T5,  T.aos - ALERT_T5_SEC },
+      { AL_T1,  T.aos - ALERT_T1_SEC },
+      { AL_AOS, T.aos },
+      { AL_LOS, T.los },
+    };
+    for (int a = 0; a < AL_COUNT; a++) {
+      if (T.alerted[pts[a].k]) continue;
+      long late = (long)(now - pts[a].when);
+      if (late >= 0 && late <= 30) {        // within the firing window
+        T.alerted[pts[a].k] = true;
+        fireAlert(pts[a].k, T.name);
+      } else if (late > 30) {
+        T.alerted[pts[a].k] = true;          // missed (e.g. powered on late) - skip quietly
+      }
+    }
   }
 }
 
@@ -872,11 +996,24 @@ void startConfigServer() {
 
 // ====================== SETUP / LOOP ======================
 void setup() {
-  M5.begin();                          // M5Unified does NOT probe SD by default
+  auto cfg = M5.config();
+  cfg.internal_spk = true;             // enable the built-in speaker for alert tones
+  M5.begin(cfg);                       // M5Unified does NOT probe SD by default
   M5.Display.setRotation(0);          // portrait 400x600 (use 2 if upside down)
   M5.Display.setAutoDisplay(false);   // EPD: accumulate drawing, push once via display()
   M5.Display.setTextDatum(top_left);  // drawString y = top of glyph (matches layout math)
   M5.Display.setFont(FONT_BODY);
+
+  // RGB LEDs (FastLED). If the data pin is wrong for your unit the rest of the
+  // app is unaffected - only the LED alerts won't show.
+  FastLED.addLeds<WS2812, LED_DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(LED_BRIGHTNESS);
+  for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB::Black;
+  FastLED.show();
+  ledsReady = true;
+
+  // Speaker volume for alert tones.
+  M5.Speaker.setVolume(ALERT_VOLUME);
 
   // Boot splash (single refresh).
   M5.Display.startWrite();
@@ -934,6 +1071,11 @@ void loop() {
   }
 
   time_t now = time(nullptr);
+
+  // Fire any due LED/sound alerts FIRST - before the event-driven recompute
+  // below, which would otherwise roll a just-started pass forward and clear its
+  // alert flags before the AOS/LOS alert could fire.
+  checkAlerts();
 
   // Event-driven recompute: when the soonest scheduled AOS/LOS has passed, a
   // tracked pass just began or ended - recompute all cells and redraw once.

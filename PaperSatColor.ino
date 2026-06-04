@@ -1,6 +1,27 @@
+// ============================================================================
+// PaperSatColor  -  4-satellite next-pass dashboard for M5Paper Color
+// ----------------------------------------------------------------------------
+// Hardware: M5Paper Color ESP32-S3 Dev Kit (4" SPECTRA 6 color e-paper, 400x600
+// portrait, RX8130CE RTC, Wi-Fi, three buttons - buttons are NOT used here).
+//
+// Concept: a STATIC dashboard. The screen is a 2x2 grid; each cell shows ONE
+// satellite's next pass as a polar (azimuth/elevation) plot of the pass ground
+// track, plus AOS/LOS times and the pass maximum azimuth and elevation. Because
+// the Spectra 6 panel takes ~15-19s to refresh and cannot do partial updates,
+// the display is drawn only when something actually changes: a tracked pass
+// begins or ends (a "pass event"), or the configuration is changed.
+//
+// Configuration is done SOLELY over Wi-Fi: the device serves a web page (its IP
+// is shown on screen) with four dropdowns - populated from the AMSAT bulletin
+// satellite list - to choose the four tracked satellites, plus optional station
+// location fields. There are no on-device menus.
+// ============================================================================
+
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include <WebServer.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <Sgp4.h>
@@ -8,171 +29,135 @@
 #include <sys/time.h>
 #include <math.h>
 #include <LittleFS.h>
-#include <ArduinoJson.h>  // Install via Library Manager: "ArduinoJson" by Benoit Blanchon
+#include <ArduinoJson.h>  // "ArduinoJson" by Benoit Blanchon
 
-// ====================== DISPLAY: M5Paper Color (ESP32-S3, 4" SPECTRA 6) ======================
-// 6-color (Spectra 6) panel: black, white, red, yellow, blue, green. Driven via
-// M5.Display (M5GFX). Refreshes are FULL only and slow (~15-19s with whole-panel
-// flashing), so we redraw rarely and use color, not animation, to convey state.
-//
-// PORTRAIT orientation: native panel is 400(w) x 600(h). setRotation(0) keeps it
-// portrait. All layout below assumes 400 wide x 600 tall.
-//
-// INPUT: no touchscreen. Three hardware buttons via M5Unified Button_Class:
-//   BtnA = UP/PREV, BtnB = SELECT (long-press = BACK), BtnC = DOWN/NEXT.
-// Navigation uses a highlight cursor (selIndex) over the focusable items on each
-// screen; A/C move it, B activates. Text entry scrolls a character with A/C and
-// commits it with B.
+// ====================== DISPLAY ======================
 #define SCR_W 400
 #define SCR_H 600
 
-// Spectra 6 palette. M5GFX maps the nearest of the 6 hardware inks for these.
+// Spectra 6 gives us six inks: black, white, red, yellow, blue, green. We use
+// each one with a consistent meaning so the dashboard reads at a glance:
 #define COL_BG       TFT_WHITE
 #define COL_FG       TFT_BLACK
-#define COL_ACCENT   TFT_RED     // current satellite, "visible now"
-#define COL_PATH     TFT_BLUE    // ground-track / pass arc
-#define COL_OK       TFT_GREEN   // good status
-#define COL_WARN     TFT_RED     // warnings/errors
-#define COL_HILITE   TFT_BLUE    // selection cursor highlight
+#define COL_AOS      TFT_GREEN   // acquisition of signal (rise) - "go"
+#define COL_LOS      TFT_RED     // loss of signal (set) - "stop"
+#define COL_PEAK     TFT_RED     // peak-elevation marker
+#define COL_PATH     TFT_BLUE    // pass ground-track arc
+#define COL_HIGH     TFT_RED     // high-elevation (excellent) pass accent
+#define COL_MED      TFT_BLUE    // medium-elevation pass accent
+#define COL_LOW      TFT_GREEN   // low-elevation (marginal) pass accent
+#define COL_NOW      TFT_RED     // "pass in progress" highlight
+#define COL_HDR      TFT_BLUE    // header text accents
+#define COL_GRID     0x8410      // mid-grey graticule (RGB565)
+#define COL_RINGFILL TFT_YELLOW  // soft fill inside the 45-deg ring
 
-// ---- Button-navigation state ----
-// selIndex is the currently highlighted focusable item on the active screen.
-// itemCount is set by each draw function so handleButtons() knows the range.
-int  selIndex = 0;
-int  itemCount = 0;
-// For text-entry screens: index into the active character set being scrolled.
-int  charCursor = 0;
-// Hold threshold (ms) for BtnB long-press = Back.
-const uint32_t HOLD_MS = 600;
+// Fonts: M5GFX bundles the GNU FreeFont family (anti-aliased, proportional),
+// far nicer than the blocky built-in Font0. We use a bold sans for headings and
+// a regular sans for body text. With top_left datum, drawString's y is the top
+// of the text (matching the rest of the layout math).
+#define FONT_NAME   &fonts::FreeSansBold9pt7b   // satellite name / headings
+#define FONT_BODY   &fonts::FreeSans9pt7b       // body text
+#define FONT_SMALL  &fonts::FreeSans9pt7b       // small labels (same face)
+#define LINE_H      16                          // ~height of 9pt FreeSans line
 
-// ====================== CONFIG ======================
+// ====================== STATION / CONFIG ======================
 double qth_lat = 38.8626;
 double qth_lon = -77.0562;
 double qth_alt = 10.0;
 
-String selectedName = "ISS";
-String selectedNorad = "25544";
+#define NUM_TRACKED 4     // 2x2 grid
+#define ARC_POINTS  24    // polar arc samples per pass
 
-struct Satellite {
-  char name[25];
-  char norad[10];
-};
-Satellite satList[200];
-int satCount = 0;
-int currentSatPage = 0;
-const int satsPerPage = 10;
-
-Sgp4 sat;
+Sgp4 sat;                 // single reused propagator (re-init per satellite)
 Preferences prefs;
+WebServer server(80);     // config web UI
 
-char currentTLE1[80], currentTLE2[80];
-time_t lastTLETime = 0;
-bool forceTLEUpdate = false;
+// Satellite catalog parsed from the AMSAT bulletin (for the web dropdowns).
+struct Satellite { char name[25]; char norad[10]; };
+Satellite satList[250];
+int satCount = 0;
 
-struct Pass {
-  time_t aos, los;
-  double maxEl;
+// One tracked dashboard satellite.
+struct TrackedSat {
+  char  norad[10];
+  char  name[25];
+  char  tle1[80];
+  char  tle2[80];
+  bool  haveTLE;
+  bool   hasPass;
+  time_t aos;
+  time_t los;
+  double maxEl;        // peak elevation (deg)
+  double aosAz;        // azimuth at AOS - where it rises (deg)
+  double losAz;        // azimuth at LOS - where it sets (deg)
+  int    arcN;
+  float  arcAz[ARC_POINTS];
+  float  arcEl[ARC_POINTS];
 };
-Pass passes[8];
-int passCount = 0;
+TrackedSat tracked[NUM_TRACKED];
 
-unsigned long lastUpdate = 0;
+const char* DEFAULT_NORAD[NUM_TRACKED] = { "25544", "43017", "27607", "22825" };
+const char* DEFAULT_NAME[NUM_TRACKED]  = { "ISS",   "AO-91", "SO-50", "AO-27" };
 
-// One-shot: becomes true once we've persisted an NTP-synced clock to the RTC.
-bool rtcSyncedFromNtp = false;
-
-// Threshold for considering time(nullptr) valid (post 2021 to detect unset NTP time)
-const time_t TLE_TIME_VALID_THRESHOLD = 1609459200LL; // 2021-01-01 UTC
-
-enum Screen { MAIN, SAT_SELECT, SETUP_MENU, GRID_INPUT, LATLON_INPUT, TIME_INPUT };
-Screen currentScreen = MAIN;
-
-String inputBuffer = "";
+time_t lastTLETime = 0;
+bool   forceTLEUpdate = false;
 String statusMsg = "Booting...";
 
-// Character sets for the 3-button text-entry screens. The two trailing pseudo
-// "characters" act as inline actions while scrolling: backspace and commit/done.
-const char* GRID_CHARS   = "ABCDEFGHIJKLMNOPQRSTUVWX0123456789";
-const char* LATLON_CHARS = "0123456789.-,";
-const char* TIME_CHARS   = "0123456789-T: ";
-const char* CHAR_BKSP = "<DEL>";
-const char* CHAR_DONE = "<DONE>";
+time_t nextEventTime = 0;   // soonest future AOS/LOS across all cells
+bool   needsRedraw = true;  // request a single redraw on next loop
+
+bool rtcSyncedFromNtp = false;
+bool fsAvailable = false;   // true only if LittleFS mounted; the app works without it
+const time_t TLE_TIME_VALID_THRESHOLD = 1609459200LL; // 2021-01-01 UTC
 
 // ====================== FORWARD DECLARATIONS ======================
-void drawMainScreen();
-void drawSatSelectScreen();
-void drawSetupMenu();
-void drawGridInputScreen();
-void drawLatLonInputScreen();
-void drawTimeInputScreen();
-void drawDegreeSymbol(int16_t x, int16_t y);
-void redrawCurrent();
-void commitGrid();
-void commitLatLon();
-void commitTime();
-void openSetupPortal();
-void saveConfig();
-void loadConfig();
-void updateData();
-bool autoLocateViaWiFi();
-void writeSystemClockToRtc();
-bool syncSystemClockFromRtc();
+void   drawDashboard();
+void   drawDegreeSymbol(int16_t x, int16_t y);
+void   saveConfig();
+void   loadConfig();
+bool   fetchBulletin();
+bool   parseGPJson(const String& payload, bool buildTrackedTLEs);
+void   recomputeAllPasses();
+void   computeNextPass(int idx);
+bool   autoLocateViaWiFi();
+void   writeSystemClockToRtc();
+bool   syncSystemClockFromRtc();
+void   startConfigServer();
+void   handleRoot();
+void   handleSave();
+void   gridToLatLon(const char* mgrid, double &lat, double &lon);
+void   latLonToGrid(double lat, double lon, char* gridOut);
 
-// ====================== HELPER ======================
-void drawDegreeSymbol(int16_t x, int16_t y) {
-  M5.Display.drawCircle(x + 3, y + 4, 2, COL_FG);
-}
-
-time_t jdToUnix(double jd) {
-  return (jd - 2440587.5) * 86400.0;
-}
+// ====================== TIME HELPERS ======================
+time_t jdToUnix(double jd) { return (time_t)((jd - 2440587.5) * 86400.0); }
 
 void setSystemTime(int year, int mon, int day, int hour, int min, int sec) {
-  struct tm t;
-  t.tm_year = year - 1900;
-  t.tm_mon = mon - 1;
-  t.tm_mday = day;
-  t.tm_hour = hour;
-  t.tm_min = min;
-  t.tm_sec = sec;
-  t.tm_isdst = 0;
+  struct tm t = {};
+  t.tm_year = year - 1900; t.tm_mon = mon - 1; t.tm_mday = day;
+  t.tm_hour = hour; t.tm_min = min; t.tm_sec = sec; t.tm_isdst = 0;
   time_t epoch = mktime(&t);
   if (epoch != (time_t)-1) {
-    struct timeval tv;
-    tv.tv_sec = epoch;
-    tv.tv_usec = 0;
+    struct timeval tv; tv.tv_sec = epoch; tv.tv_usec = 0;
     settimeofday(&tv, NULL);
-    writeSystemClockToRtc();   // persist across power loss
+    writeSystemClockToRtc();
   }
 }
 
-// ====================== REAL-TIME CLOCK (RX8130CE) ======================
-// The board has a battery-backed RTC. We use it so the tracker has a valid UTC
-// clock the instant it powers on, even with no Wi-Fi, and so manually entered or
-// NTP-synced time survives a full power-off. All RTC values are kept in UTC, to
-// match NTP (configTime offset 0) and the UTC-labeled displays.
-
-// Write the current ESP32 system clock into the RTC (call after NTP or manual set).
+// ====================== RTC (RX8130CE) ======================
 void writeSystemClockToRtc() {
   if (!M5.Rtc.isEnabled()) return;
   time_t now = time(nullptr);
-  if (now < TLE_TIME_VALID_THRESHOLD) return;  // don't store an unset clock
+  if (now < TLE_TIME_VALID_THRESHOLD) return;
   M5.Rtc.setDateTime(gmtime(&now));
 }
-
-// Seed the ESP32 system clock from the RTC at boot. Returns true if the RTC held
-// a plausible time (year >= 2021) and the system clock was set from it.
 bool syncSystemClockFromRtc() {
   if (!M5.Rtc.isEnabled()) return false;
   auto dt = M5.Rtc.getDateTime();
-  if (dt.date.year < 2021) return false;       // RTC never set / lost power
-  struct tm t = dt.get_tm();
-  t.tm_isdst = 0;
-  time_t epoch = mktime(&t);                    // tm is UTC (ESP32 default TZ)
+  if (dt.date.year < 2021) return false;
+  struct tm t = dt.get_tm(); t.tm_isdst = 0;
+  time_t epoch = mktime(&t);
   if (epoch == (time_t)-1) return false;
-  struct timeval tv;
-  tv.tv_sec = epoch;
-  tv.tv_usec = 0;
+  struct timeval tv; tv.tv_sec = epoch; tv.tv_usec = 0;
   settimeofday(&tv, NULL);
   return true;
 }
@@ -183,171 +168,124 @@ void gridToLatLon(const char* mgrid, double &lat, double &lon) {
   if (g.length() < 4) return;
   lon = (g[0]-'A')*20.0 - 180.0 + 1.0;
   lat = (g[1]-'A')*10.0 - 90.0 + 0.5;
-  if (g.length() >= 4) {
-    lon += (g[2]-'0')*2.0;
-    lat += (g[3]-'0')*1.0;
-  }
+  lon += (g[2]-'0')*2.0;
+  lat += (g[3]-'0')*1.0;
   if (g.length() >= 6) {
     lon += (tolower(g[4])-'a')*(2.0/24.0);
     lat += (tolower(g[5])-'a')*(1.0/24.0);
   }
 }
-
 void latLonToGrid(double lat, double lon, char* gridOut) {
-  // Normalize longitude to -180..180
-  lon = fmod(lon + 180.0, 360.0);
-  if (lon < 0) lon += 360.0;
-  lon -= 180.0;
-
+  lon = fmod(lon + 180.0, 360.0); if (lon < 0) lon += 360.0; lon -= 180.0;
   lat = fmax(-90.0, fmin(90.0, lat));
-
   int fieldLon = (int)((lon + 180.0) / 20.0);
   int fieldLat = (int)((lat + 90.0) / 10.0);
-
   double squareLon = fmod((lon + 180.0), 20.0) / 2.0;
   double squareLat = fmod((lat + 90.0), 10.0);
+  gridOut[0]='A'+fieldLon; gridOut[1]='A'+fieldLat;
+  gridOut[2]='0'+(int)squareLon; gridOut[3]='0'+(int)squareLat;
+  gridOut[4]='a'+(int)(squareLon*12.0); gridOut[5]='a'+(int)(squareLat*24.0); gridOut[6]='\0';
+}
 
-  int subsquareLon = (int)(squareLon * 12.0);
-  int subsquareLat = (int)(squareLat * 24.0);
-
-  gridOut[0] = 'A' + fieldLon;
-  gridOut[1] = 'A' + fieldLat;
-  gridOut[2] = '0' + (int)squareLon;
-  gridOut[3] = '0' + (int)squareLat;
-  gridOut[4] = 'a' + subsquareLon;
-  gridOut[5] = 'a' + subsquareLat;
-  gridOut[6] = '\0';
+// ====================== CONFIG STORAGE ======================
+void loadConfig() {
+  prefs.begin("satdash", true);
+  qth_lat = prefs.getDouble("lat", qth_lat);
+  qth_lon = prefs.getDouble("lon", qth_lon);
+  qth_alt = prefs.getDouble("alt", qth_alt);
+  lastTLETime = prefs.getULong("lastTLE", 0);
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    char kn[8], km[8], k1[8], k2[8];
+    snprintf(kn,sizeof(kn),"n%d",i); snprintf(km,sizeof(km),"m%d",i);
+    snprintf(k1,sizeof(k1),"t1_%d",i); snprintf(k2,sizeof(k2),"t2_%d",i);
+    String n = prefs.getString(kn, DEFAULT_NORAD[i]);
+    String m = prefs.getString(km, DEFAULT_NAME[i]);
+    n.toCharArray(tracked[i].norad, sizeof(tracked[i].norad));
+    m.toCharArray(tracked[i].name,  sizeof(tracked[i].name));
+    tracked[i].haveTLE = false; tracked[i].hasPass = false;
+    prefs.getString(k1, tracked[i].tle1, sizeof(tracked[i].tle1));
+    prefs.getString(k2, tracked[i].tle2, sizeof(tracked[i].tle2));
+    if (strlen(tracked[i].tle1) > 60 && strlen(tracked[i].tle2) > 60) tracked[i].haveTLE = true;
+  }
+  prefs.end();
+}
+void saveConfig() {
+  prefs.begin("satdash", false);
+  prefs.putDouble("lat", qth_lat);
+  prefs.putDouble("lon", qth_lon);
+  prefs.putDouble("alt", qth_alt);
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    char kn[8], km[8];
+    snprintf(kn,sizeof(kn),"n%d",i); snprintf(km,sizeof(km),"m%d",i);
+    prefs.putString(kn, tracked[i].norad);
+    prefs.putString(km, tracked[i].name);
+  }
+  prefs.end();
 }
 
 // ====================== WIFI GEOLOCATION ======================
 bool autoLocateViaWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    statusMsg = "WiFi not connected for location";
-    drawMainScreen();
-    return false;
-  }
+  if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http;
-  // ip-api.com is reliable, no key needed for moderate use, returns clean JSON
   http.begin("http://ip-api.com/json/?fields=status,lat,lon,city,country");
   http.setTimeout(12000);
   int code = http.GET();
-  if (code == HTTP_CODE_OK) {
-    String payload = http.getString();
-    http.end();
+  if (code == 200) {
+    String payload = http.getString(); http.end();
     DynamicJsonDocument doc(1536);
-    DeserializationError err = deserializeJson(doc, payload);
-    if (!err && doc["status"] == "success" && doc.containsKey("lat") && doc.containsKey("lon")) {
+    if (!deserializeJson(doc, payload) && doc["status"] == "success" &&
+        doc.containsKey("lat") && doc.containsKey("lon")) {
       qth_lat = doc["lat"].as<double>();
       qth_lon = doc["lon"].as<double>();
       saveConfig();
-
-      char grid[7];
-      latLonToGrid(qth_lat, qth_lon, grid);
-      statusMsg = "WiFi Loc: " + String(grid);
-      drawMainScreen();
       return true;
     }
-  } else {
-    http.end();
-  }
-  statusMsg = "WiFi geolocation failed";
-  drawMainScreen();
+  } else http.end();
   return false;
 }
 
-void loadConfig() {
-  prefs.begin("sattracker", true);
-  qth_lat = prefs.getDouble("lat", 40.7128);
-  qth_lon = prefs.getDouble("lon", -74.0060);
-  selectedNorad = prefs.getString("norad", "25544");
-  selectedName = prefs.getString("name", "ISS");
-  lastTLETime = prefs.getULong("lastTLE", 0);
-  prefs.getString("tle1", currentTLE1, sizeof(currentTLE1));
-  prefs.getString("tle2", currentTLE2, sizeof(currentTLE2));
-  prefs.end();
-}
-
-void saveConfig() {
-  prefs.begin("sattracker", false);
-  prefs.putDouble("lat", qth_lat);
-  prefs.putDouble("lon", qth_lon);
-  prefs.putString("norad", selectedNorad);
-  prefs.putString("name", selectedName);
-  prefs.end();
-}
-
-// ====================== GP ORBITAL ELEMENTS -> TLE ======================
-// AMSAT's daily-bulletin.json "tle" text field is being deprecated (the 5-digit
-// NORAD catalog runs out ~2026, after which new objects get 6-digit catalog
-// numbers that don't fit the TLE text format). The JSON still carries every
-// discrete GP/OMM orbital element, so we rebuild the two standard SGP4 TLE lines
-// from those fields. The reconstructed lines are byte-format-identical to the
-// classic AMSAT TLE the SGP4 library already accepts.
-
-// Standard TLE checksum over the first 68 columns: digits add their value,
-// a '-' adds 1, everything else adds 0; result mod 10.
+// ====================== GP ELEMENTS -> TLE ======================
 static char tleChecksum(const char* line) {
   int sum = 0;
   for (int i = 0; i < 68 && line[i]; i++) {
     char c = line[i];
-    if (c >= '0' && c <= '9') sum += c - '0';
-    else if (c == '-') sum += 1;
+    if (c >= '0' && c <= '9') sum += c - '0'; else if (c == '-') sum += 1;
   }
   return '0' + (sum % 10);
 }
-
-// Format a value into the 8-char TLE assumed-decimal exponential field used by
-// BSTAR and the 2nd derivative, e.g. 0.0001293 -> " 12930-3" (= .12930e-3).
 static void tleExpField(double value, char* out) {
   if (value == 0.0 || !isfinite(value)) { strcpy(out, " 00000-0"); return; }
   char sign = (value < 0) ? '-' : ' ';
-  double a = fabs(value);
-  int exp = 0;
+  double a = fabs(value); int exp = 0;
   while (a >= 1.0) { a /= 10.0; exp++; }
   while (a < 0.1)  { a *= 10.0; exp--; }
   long mant = lround(a * 100000.0);
-  if (mant >= 100000) { mant /= 10; exp++; }   // guard rounding overflow
+  if (mant >= 100000) { mant /= 10; exp++; }
   sprintf(out, "%c%05ld%c%d", sign, mant, (exp < 0) ? '-' : '+', abs(exp));
 }
-
-// Convert "YYYY-MM-DD HH:MM:SS.ssssss" (also accepts the 'T' separator) into a
-// 2-digit epoch year and fractional day-of-year, as needed for TLE columns 19-32.
 static bool parseGPEpoch(const char* epoch, int &yy, double &doy) {
   int Y, Mo, D, h, m; double s = 0.0;
   int n = sscanf(epoch, "%d-%d-%d %d:%d:%lf", &Y, &Mo, &D, &h, &m, &s);
   if (n < 6) n = sscanf(epoch, "%d-%d-%dT%d:%d:%lf", &Y, &Mo, &D, &h, &m, &s);
   if (n < 5) return false;
   static const int cum[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
-  bool leap = (Y % 4 == 0 && (Y % 100 != 0 || Y % 400 == 0));
-  int day = cum[Mo - 1] + D + ((leap && Mo > 2) ? 1 : 0);
-  doy = (double)day + (h * 3600.0 + m * 60.0 + s) / 86400.0;
+  bool leap = (Y%4==0 && (Y%100!=0 || Y%400==0));
+  int day = cum[Mo-1] + D + ((leap && Mo>2)?1:0);
+  doy = (double)day + (h*3600.0 + m*60.0 + s)/86400.0;
   yy = Y % 100;
   return true;
 }
-
-// Build standard TLE line1/line2 (NUL-terminated, 69 cols) from a GP JSON object.
-// Returns false if the mandatory elements are missing/invalid.
 static bool buildTLEFromGP(JsonObject s, char* tle1, char* tle2) {
   const char* epochC = s["EPOCH"] | "";
   if (strlen(epochC) < 10) return false;
-
   int yy; double doy;
   if (!parseGPEpoch(epochC, yy, doy)) return false;
-
   double mm = s["MEAN_MOTION"].as<double>();
-  if (mm <= 0.0) return false;  // no usable elements
-
+  if (mm <= 0.0) return false;
   long catnum = s["NORAD_CAT_ID"].as<long>();
-  // SGP4 math never uses the catalog number; clamp to 5 cols so the fixed-width
-  // TLE layout stays valid even once 6-digit (100000+) catalog numbers appear.
   long catCol = (catnum > 99999) ? (catnum % 100000) : catnum;
-
-  char cls = ((const char*)(s["CLASSIFICATION_TYPE"] | "U"))[0];
-  if (cls == 0) cls = 'U';
-  char eph = ((const char*)(s["EPHEMERIS_TYPE"] | "0"))[0];
-  if (eph == 0) eph = '0';
-
-  // International designator from OBJECT_ID "YYYY-NNNAAA" -> "YYNNNAAA" (8 cols).
+  char cls = ((const char*)(s["CLASSIFICATION_TYPE"] | "U"))[0]; if (cls==0) cls='U';
+  char eph = '0' + (char)(s["EPHEMERIS_TYPE"].as<int>() % 10);   // numeric in the GP JSON
   char intl[9] = "        ";
   const char* oid = s["OBJECT_ID"] | "";
   const char* dash = strchr(oid, '-');
@@ -356,960 +294,668 @@ static bool buildTLEFromGP(JsonObject s, char* tle1, char* tle2) {
     snprintf(tmp, sizeof(tmp), "%c%c%s", oid[2], oid[3], dash + 1);
     snprintf(intl, sizeof(intl), "%-8.8s", tmp);
   }
-
-  double ndot    = s["MEAN_MOTION_DOT"].as<double>();
-  double ndotdot = s["MEAN_MOTION_DDOT"].as<double>();
-  double bstar   = s["BSTAR"].as<double>();
-  double incl    = s["INCLINATION"].as<double>();
-  double raan    = s["RA_OF_ASC_NODE"].as<double>();
-  double ecc     = s["ECCENTRICITY"].as<double>();
-  double argp    = s["ARG_OF_PERICENTER"].as<double>();
-  double ma      = s["MEAN_ANOMALY"].as<double>();
-  long   elset   = (long)(s["ELEMENT_SET_NO"] | 0.0);
-  long   revnum  = s["REV_AT_EPOCH"].as<long>() % 100000;
-
+  double ndot=s["MEAN_MOTION_DOT"].as<double>(), ndotdot=s["MEAN_MOTION_DDOT"].as<double>();
+  double bstar=s["BSTAR"].as<double>(), incl=s["INCLINATION"].as<double>();
+  double raan=s["RA_OF_ASC_NODE"].as<double>(), ecc=s["ECCENTRICITY"].as<double>();
+  double argp=s["ARG_OF_PERICENTER"].as<double>(), ma=s["MEAN_ANOMALY"].as<double>();
+  long elset=(long)(s["ELEMENT_SET_NO"] | 0.0), revnum=s["REV_AT_EPOCH"].as<long>()%100000;
   char ndotStr[16];
-  sprintf(ndotStr, "%c.%08ld", (ndot < 0) ? '-' : ' ', lround(fabs(ndot) * 1e8));
+  sprintf(ndotStr, "%c.%08ld", (ndot<0)?'-':' ', lround(fabs(ndot)*1e8));
   char ddotStr[10], bstarStr[10];
-  tleExpField(ndotdot, ddotStr);
-  tleExpField(bstar, bstarStr);
-
-  // ---- Line 1 (68-char body + checksum) ----
+  tleExpField(ndotdot, ddotStr); tleExpField(bstar, bstarStr);
   sprintf(tle1, "1 %5ld%c %-8s %02d%012.8f %s %s %s %c %4ld",
           catCol, cls, intl, yy, doy, ndotStr, ddotStr, bstarStr, eph, elset);
-  tle1[68] = tleChecksum(tle1);
-  tle1[69] = '\0';
-
-  // ---- Line 2 (eccentricity is 7 digits with an assumed leading decimal) ----
-  long eccCol = lround(ecc * 1e7);
+  tle1[68]=tleChecksum(tle1); tle1[69]='\0';
+  long eccCol = lround(ecc*1e7);
   sprintf(tle2, "2 %5ld %8.4f %8.4f %07ld %8.4f %8.4f %11.8f%5ld",
           catCol, incl, raan, eccCol, argp, ma, mm, revnum);
-  tle2[68] = tleChecksum(tle2);
-  tle2[69] = '\0';
-
+  tle2[68]=tleChecksum(tle2); tle2[69]='\0';
   return true;
 }
 
-// ====================== GP Data from AMSAT daily-bulletin.json (orbital elements -> TLE for SGP4) ======================
-bool parseGPJson(const String& payload) {
+bool parseGPJson(const String& payload, bool buildTrackedTLEs) {
   satCount = 0;
-  DynamicJsonDocument doc(49152);  // Sufficient for ~89K daily-bulletin.json; uses PSRAM on M5Paper S3 if available
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    // JSON parse failed; could log but no Serial in normal run
-    return false;
-  }
-
+  // The AMSAT bulletin can be ~90KB+ of JSON with full GP element fields for
+  // every satellite. ArduinoJson needs several times the text size as working
+  // memory, so allocate generously - the S3 has 8MB PSRAM and DynamicJsonDocument
+  // will draw from it. (49152 was far too small and caused "GP parse failed".)
+  DynamicJsonDocument doc(512 * 1024);
+  DeserializationError derr = deserializeJson(doc, payload);
+  if (derr) { statusMsg = String("JSON err: ") + derr.c_str(); return false; }
   JsonArray sats;
-  if (doc.is<JsonArray>()) {
-    sats = doc.as<JsonArray>();
-  } else if (doc["satellites"].is<JsonArray>()) {
-    sats = doc["satellites"].as<JsonArray>();
-  } else if (doc["data"].is<JsonArray>()) {
-    sats = doc["data"].as<JsonArray>();
-  } else if (doc["GP"].is<JsonArray>()) {
-    sats = doc["GP"].as<JsonArray>();
-  } else if (doc["elements"].is<JsonArray>()) {
-    sats = doc["elements"].as<JsonArray>();
-  } else {
-    return false; // unknown structure
-  }
+  if (doc.is<JsonArray>())                    sats = doc.as<JsonArray>();
+  else if (doc["satellites"].is<JsonArray>()) sats = doc["satellites"].as<JsonArray>();
+  else if (doc["data"].is<JsonArray>())       sats = doc["data"].as<JsonArray>();
+  else if (doc["GP"].is<JsonArray>())         sats = doc["GP"].as<JsonArray>();
+  else if (doc["elements"].is<JsonArray>())   sats = doc["elements"].as<JsonArray>();
+  else return false;
 
   for (JsonObject s : sats) {
-    if (satCount >= 200) break;
+    if (satCount >= 250) break;
+
+    // Name: a string in every variant.
     const char* nameC = s["AMSAT_NAME"] | s["OBJECT_NAME"] | s["name"] | s["SATNAME"] | s["title"] | "";
-    const char* noradC = s["NORAD_CAT_ID"] | s["norad"] | s["CATNR"] | s["NORAD"] | s["id"] | "";
     String nameStr(nameC);
-    String noradStr(noradC);
     nameStr.trim();
+
+    // NORAD catalog id: in the CelesTrak GP / OMM JSON it is a NUMBER
+    // (e.g. "NORAD_CAT_ID": 25544), so reading it with a string fallback yields
+    // an empty string and every satellite gets skipped (the cause of
+    // "GP parse failed"). Read it as a long when numeric, else as a string.
+    String noradStr;
+    JsonVariant nv = s["NORAD_CAT_ID"];
+    if (nv.isNull()) nv = s["norad"];
+    if (nv.isNull()) nv = s["CATNR"];
+    if (nv.isNull()) nv = s["NORAD"];
+    if (nv.isNull()) nv = s["id"];
+    if (nv.is<long>()) {
+      noradStr = String((long)nv.as<long>());
+    } else {
+      noradStr = String((const char*)(nv | ""));
+    }
     noradStr.trim();
-    if (nameStr.length() > 0 && noradStr.length() > 0) {
-      nameStr.toCharArray(satList[satCount].name, sizeof(satList[satCount].name));
-      noradStr.toCharArray(satList[satCount].norad, sizeof(satList[satCount].norad));
 
-      // If this is the currently selected satellite, build its TLE from the
-      // discrete GP orbital-element fields (MEAN_MOTION, ECCENTRICITY, EPOCH,
-      // INCLINATION, etc.) instead of the deprecated "tle" text field.
-      if (noradStr == selectedNorad) {
-        char t1[80], t2[80];
-        bool built = buildTLEFromGP(s, t1, t2);
+    if (nameStr.length()==0 || noradStr.length()==0) continue;
+    nameStr.toCharArray(satList[satCount].name, sizeof(satList[satCount].name));
+    noradStr.toCharArray(satList[satCount].norad, sizeof(satList[satCount].norad));
 
-        // Transitional fallback: if the GP element fields are absent but the
-        // legacy "tle" text field is still present, parse that instead.
-        if (!built) {
-          String tleStr = s["tle"] | "";
-          if (tleStr.length() > 20) {
-            int firstNewline = tleStr.indexOf('\n');
-            if (firstNewline > 0) {
-              int secondNewline = tleStr.indexOf('\n', firstNewline + 1);
-              if (secondNewline > firstNewline) {
-                String line1 = tleStr.substring(firstNewline + 1, secondNewline);
-                String line2 = tleStr.substring(secondNewline + 1);
-                line1.trim();
-                line2.trim();
-                line1.toCharArray(t1, sizeof(t1));
-                line2.toCharArray(t2, sizeof(t2));
-                built = (strlen(t1) > 60 && strlen(t2) > 60);
+    if (buildTrackedTLEs) {
+      long thisNorad = atol(noradStr.c_str());
+      for (int i = 0; i < NUM_TRACKED; i++) {
+        // Compare numerically so "07530" (config) matches 7530 (JSON number).
+        if (atol(tracked[i].norad) == thisNorad && thisNorad != 0) {
+          char t1[80], t2[80];
+          bool built = buildTLEFromGP(s, t1, t2);
+          if (!built) {
+            String tleStr = s["tle"] | "";
+            if (tleStr.length() > 20) {
+              int n1 = tleStr.indexOf('\n');
+              if (n1 > 0) {
+                int n2 = tleStr.indexOf('\n', n1 + 1);
+                if (n2 > n1) {
+                  String l1 = tleStr.substring(n1+1, n2), l2 = tleStr.substring(n2+1);
+                  l1.trim(); l2.trim();
+                  l1.toCharArray(t1, sizeof(t1)); l2.toCharArray(t2, sizeof(t2));
+                  built = (strlen(t1) > 60 && strlen(t2) > 60);
+                }
               }
             }
           }
-        }
-
-        if (built) {
-          strncpy(currentTLE1, t1, sizeof(currentTLE1));
-          strncpy(currentTLE2, t2, sizeof(currentTLE2));
-          currentTLE1[sizeof(currentTLE1) - 1] = '\0';
-          currentTLE2[sizeof(currentTLE2) - 1] = '\0';
-
-          // Also save to Preferences for offline use
-          prefs.begin("sattracker", false);
-          prefs.putString("tle1", currentTLE1);
-          prefs.putString("tle2", currentTLE2);
-          prefs.end();
+          if (built) {
+            strncpy(tracked[i].tle1, t1, sizeof(tracked[i].tle1));
+            strncpy(tracked[i].tle2, t2, sizeof(tracked[i].tle2));
+            tracked[i].tle1[sizeof(tracked[i].tle1)-1]='\0';
+            tracked[i].tle2[sizeof(tracked[i].tle2)-1]='\0';
+            tracked[i].haveTLE = true;
+            nameStr.toCharArray(tracked[i].name, sizeof(tracked[i].name));
+            char k1[8], k2[8];
+            snprintf(k1,sizeof(k1),"t1_%d",i); snprintf(k2,sizeof(k2),"t2_%d",i);
+            prefs.begin("satdash", false);
+            prefs.putString(k1, tracked[i].tle1);
+            prefs.putString(k2, tracked[i].tle2);
+            prefs.end();
+          }
         }
       }
-
-      satCount++;
     }
+    satCount++;
   }
   return satCount > 0;
 }
 
-bool fetchTLE() {
-  bool haveLocal = LittleFS.exists("/daily-bulletin.json");
+bool fetchBulletin() {
+  bool haveLocal = fsAvailable && LittleFS.exists("/daily-bulletin.json");
   time_t now = time(nullptr);
   bool timeValid = (now > TLE_TIME_VALID_THRESHOLD);
 
   bool needDownload = false;
-  bool forceThisTime = forceTLEUpdate;
-  forceTLEUpdate = false;  // reset after this call
+  bool forceThisTime = forceTLEUpdate; forceTLEUpdate = false;
   if (WiFi.status() == WL_CONNECTED) {
-    if (forceThisTime || lastTLETime == 0 || (timeValid && (now - lastTLETime > 86400))) {
-      needDownload = true;
-    } else if (!haveLocal) {
-      // No local cache file persisted (e.g. LittleFS write issue); retry periodically (every ~1h)
-      // to acquire GP data without hammering AMSAT server every 60s on repeated refresh
-      if (lastTLETime == 0 || (timeValid && (now - lastTLETime > 3600))) {
-        needDownload = true;
-      }
-    }
+    if (forceThisTime || lastTLETime == 0 || (timeValid && (now - lastTLETime > 86400))) needDownload = true;
+    else if (!haveLocal && (lastTLETime == 0 || (timeValid && (now - lastTLETime > 3600)))) needDownload = true;
   }
 
   if (needDownload && WiFi.status() == WL_CONNECTED) {
-    statusMsg = "Downloading AMSAT GP data...";
-    drawMainScreen();
+    // Use an explicit TLS client set to insecure (no cert pinning). The AMSAT
+    // host's certificate chain isn't bundled on-device, so without this the
+    // HTTPS GET fails with -1 and we'd fall through with no data.
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(25);
 
     HTTPClient http;
-    http.begin("https://newark192.amsat.org/gpdata/current/daily-bulletin.json");
+    http.begin(client, "https://newark192.amsat.org/gpdata/current/daily-bulletin.json");
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setTimeout(25000);
     int code = http.GET();
-
-    if (code == HTTP_CODE_OK) {
-      String payload = http.getString();
-      http.end();
-
-      // Save to local LittleFS for offline use (the curated amateur satellite GP bulletin)
-      File f = LittleFS.open("/daily-bulletin.json", "w");
-      if (f) {
-        f.print(payload);
-        f.close();
+    if (code == 200) {
+      String payload = http.getString(); http.end();
+      if (fsAvailable) {
+        File f = LittleFS.open("/daily-bulletin.json", "w");
+        if (f) { f.print(payload); f.close(); }
       }
-
-      if (now > TLE_TIME_VALID_THRESHOLD) {
-        lastTLETime = now;
-        prefs.begin("sattracker", false);
-        prefs.putULong("lastTLE", (unsigned long)lastTLETime);
-        prefs.end();
-      } else {
-        lastTLETime = 1;  // non-zero sentinel (RAM only)
+      lastTLETime = timeValid ? now : 1;
+      if (timeValid) { prefs.begin("satdash", false); prefs.putULong("lastTLE",(unsigned long)lastTLETime); prefs.end(); }
+      if (payload.length() > 100 && parseGPJson(payload, true)) {
+        statusMsg = "GP data updated"; return true;
       }
-
-      if (parseGPJson(payload)) {
-        // Successfully parsed satellite list + TLE directly from AMSAT GP bulletin.
-        // No Celestrak call is made (purely local parsing).
-        if (strlen(currentTLE1) > 60 && strlen(currentTLE2) > 60) {
-          struct tm t = *gmtime(&now);
-          char msg[50];
-          sprintf(msg, "GP Data %02d/%02d/%04d %02d:%02d UTC", 
-                  t.tm_mon + 1, t.tm_mday, t.tm_year + 1900,
-                  t.tm_hour, t.tm_min);
-          statusMsg = msg;
-          return true;
-        } else {
-          statusMsg = "GP list loaded but no TLE for selected satellite";
-          return (strlen(currentTLE1) > 10); // use cached TLE if available
-        }
-      } else {
-        statusMsg = "GP JSON parse failed after download";
-        return false;
-      }
+      statusMsg = "GP parse failed (" + String((int)payload.length()) + " bytes)";
+      // fall through to try a cached copy
     } else {
       http.end();
-      statusMsg = "Download failed (code " + String(code) + "), using local...";
-      if (now > TLE_TIME_VALID_THRESHOLD) {
-        lastTLETime = now;
-        prefs.begin("sattracker", false);
-        prefs.putULong("lastTLE", (unsigned long)lastTLETime);
-        prefs.end();
-      } else {
-        lastTLETime = 1;
-      }
-      // fall through to local load
+      statusMsg = "Download failed (HTTP " + String(code) + ")";
+      // fall through to try a cached copy
     }
   }
 
-  // Fallback / normal path: load from local JSON file (offline operation with last known GP list + cached TLE lines)
   if (haveLocal) {
     File f = LittleFS.open("/daily-bulletin.json", "r");
     if (f) {
-      String payload = f.readString();
-      f.close();
-      if (parseGPJson(payload)) {
-        if (needDownload) {
-          statusMsg = "Using local GP data (update failed)";
-        } else {
-          statusMsg = "Using cached local GP data";
-        }
-        return (strlen(currentTLE1) > 10);
+      String payload = f.readString(); f.close();
+      if (payload.length() > 100 && parseGPJson(payload, true)) {
+        statusMsg = needDownload ? "Using cached GP data" : "GP data loaded";
+        return true;
       }
     }
   }
 
-  if (WiFi.status() != WL_CONNECTED && !haveLocal) {
-    statusMsg = "No Wifi & No local GP data";
-  } else {
-    statusMsg = "No GP data available";
-  }
+  if (WiFi.status() != WL_CONNECTED && !haveLocal) statusMsg = "No WiFi yet, no cached data";
+  else if (!needDownload && !haveLocal)            statusMsg = "Waiting for first download";
+  // keep whatever more-specific error was set above otherwise
   return false;
 }
 
-void predictPasses() {
-  passCount = 0;
+// ====================== PASS PREDICTION ======================
+void computeNextPass(int idx) {
+  TrackedSat &T = tracked[idx];
+  T.hasPass = false; T.arcN = 0;
+  if (!T.haveTLE) return;
+
+  sat.init(T.name, T.tle1, T.tle2);
   sat.site(qth_lat, qth_lon, qth_alt);
 
   passinfo p;
-  // Use library's pass finder (reliable for detecting passes, maxEl, and LOS/jdstop)
-  // but compute AOS manually from the peak because library jdstart is buggy for some sats like RS-44
   sat.initpredpoint((unsigned long)time(nullptr), 0.0);
 
-  while (passCount < 8) {
-    if (!sat.nextpass(&p, 40, false, 0.0)) {
-      break; // no more passes found
+  int guard = 0;
+  while (guard++ < 12) {
+    if (!sat.nextpass(&p, 40, false, 0.0)) return;
+    if (p.maxelevation <= 0.5 || p.jdstop <= p.jdmax) continue;
+
+    time_t peakTime = jdToUnix(p.jdmax);
+    time_t losTime  = jdToUnix(p.jdstop);
+
+    time_t aosTime = peakTime; bool crossed = false;
+    for (long back = 0; back < 2*3600; back += 30) {
+      time_t tt = peakTime - back;
+      if (tt < time(nullptr) - 3600) break;
+      sat.findsat((unsigned long)tt);
+      if (sat.satEl <= 0.0) { aosTime = tt; crossed = true; break; }
     }
-    // Only accept passes with reasonable max elevation and valid stop > max time
-    if (p.maxelevation > 0.5 && p.jdstop > p.jdmax) {
-      // Library provides good p.jdmax, p.jdstop (LOS), p.maxelevation
-      // Ignore p.jdstart (often wrongly equals LOS or peak time)
-      time_t peakTime = jdToUnix(p.jdmax);
-      time_t losTimeLib = jdToUnix(p.jdstop);
-
-      // Manually find AOS by searching backward from peak until elevation drops to <=0
-      time_t aosTime = peakTime;
-      const long COARSE_BACK_SEC = 30;
-      bool crossedBelow = false;
-      for (long back = 0; back < 2 * 3600; back += COARSE_BACK_SEC) { // search up to 2 hours back
-        time_t tt = peakTime - back;
-        if (tt < time(nullptr) - 3600) break;
-        sat.findsat((unsigned long)tt);
-        if (sat.satEl <= 0.0) {
-          aosTime = tt;
-          crossedBelow = true;
-          break;
-        }
-      }
-      if (!crossedBelow) {
-        continue; // couldn't find AOS, skip this pass
-      }
-
-      // Refine AOS: step forward from the rough below point to find first time El > 0
-      time_t refinedAOS = aosTime;
-      for (int d = 0; d < 120; ++d) { // up to 2 minutes refine window
-        time_t tt = aosTime + d;
-        sat.findsat((unsigned long)tt);
-        if (sat.satEl > 0.0) {
-          refinedAOS = tt;
-          break;
-        }
-      }
-
-      // Use library's LOS (confirmed correct by user) and maxEl
-      time_t refinedLOS = losTimeLib;
-
-      if (refinedLOS > refinedAOS + 30) {
-        passes[passCount].aos = refinedAOS;
-        passes[passCount].los = refinedLOS;
-        passes[passCount].maxEl = p.maxelevation;
-        passCount++;
-      }
+    if (!crossed) continue;
+    for (int d = 0; d < 120; d++) {
+      sat.findsat((unsigned long)(aosTime + d));
+      if (sat.satEl > 0.0) { aosTime += d; break; }
     }
+    if (losTime <= aosTime + 30) continue;
+
+    // Azimuth where the satellite rises (AOS) and sets (LOS).
+    sat.findsat((unsigned long)aosTime);
+    double azAtAos = sat.satAz;
+    sat.findsat((unsigned long)losTime);
+    double azAtLos = sat.satAz;
+
+    long dur = losTime - aosTime;
+    int n = 0;
+    for (int k = 0; k < ARC_POINTS; k++) {
+      time_t tt = aosTime + (time_t)((double)dur * k / (ARC_POINTS - 1));
+      sat.findsat((unsigned long)tt);
+      if (sat.satEl >= 0.0) { T.arcAz[n] = (float)sat.satAz; T.arcEl[n] = (float)sat.satEl; n++; }
+    }
+    T.arcN = n;
+    T.aos = aosTime; T.los = losTime;
+    T.maxEl = p.maxelevation; T.aosAz = azAtAos; T.losAz = azAtLos;
+    T.hasPass = true;
+    return;
   }
 }
 
-void updateCurrentPosition() {
-  sat.findsat((unsigned long)time(nullptr));
-}
-
-void updateData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    statusMsg = "WiFi disconnected - retrying...";
-    WiFi.begin();
-    delay(1500);
+void recomputeAllPasses() {
+  for (int i = 0; i < NUM_TRACKED; i++) computeNextPass(i);
+  time_t now = time(nullptr);
+  nextEventTime = 0;
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    if (!tracked[i].hasPass) continue;
+    time_t evt = (tracked[i].aos > now) ? tracked[i].aos : tracked[i].los;
+    if (evt > now && (nextEventTime == 0 || evt < nextEventTime)) nextEventTime = evt;
   }
-  if (fetchTLE()) {
-    sat.init(selectedName.c_str(), currentTLE1, currentTLE2);
-    sat.site(qth_lat, qth_lon, qth_alt);
-    predictPasses();
-    updateCurrentPosition();
-    statusMsg = "Tracking " + selectedName;
-  }
-  lastUpdate = millis();
 }
 
 // ====================== BATTERY ======================
 int getBatteryPercent() {
-  float voltage = M5.Power.getBatteryVoltage() / 1000.0;
-  int percent = (voltage - 3.4) / (4.2 - 3.4) * 100;
-  if (percent > 100) percent = 100;
-  if (percent < 0) percent = 0;
-  return percent;
+  float v = M5.Power.getBatteryVoltage() / 1000.0;
+  int pct = (int)((v - 3.4) / (4.2 - 3.4) * 100);
+  if (pct > 100) pct = 100; if (pct < 0) pct = 0;
+  return pct;
 }
 
-// ====================== BUTTON-NAV HELPERS ======================
-// Draw a full-width menu row; highlighted rows get an inverted (filled) style so
-// the selection is obvious on a slow color EPD without needing a blinking cursor.
-void drawMenuItem(int x, int y, int w, int h, const char* label, bool selected) {
-  if (selected) {
-    M5.Display.fillRoundRect(x, y, w, h, 6, COL_HILITE);
-    M5.Display.setTextColor(COL_BG);
-  } else {
-    M5.Display.drawRoundRect(x, y, w, h, 6, COL_FG);
-    M5.Display.setTextColor(COL_FG);
+// ====================== DRAWING ======================
+void drawDegreeSymbol(int16_t x, int16_t y) {
+  M5.Display.drawCircle(x + 3, y + 4, 2, COL_FG);  // sits at the cap height of 9pt sans
+}
+
+// Draw one satellite cell: a polar az/el plot of the next pass plus text.
+// Layout is built top-down from a cursor with explicit padding so nothing
+// overlaps and there is breathing room on every side.
+void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
+  TrackedSat &T = tracked[idx];
+
+  const int PAD = 9;                 // interior padding from the cell edges
+  int innerX = originX + PAD;
+  int innerW = cellW - 2 * PAD;
+
+  // Pass-quality accent color from peak elevation:
+  //   < 20 deg marginal (green), 20-50 good (blue), > 50 excellent (red).
+  int quality = COL_MED;
+  if (T.hasPass) {
+    if      (T.maxEl >= 50.0) quality = COL_HIGH;
+    else if (T.maxEl >= 20.0) quality = COL_MED;
+    else                      quality = COL_LOW;
   }
-  M5.Display.drawString(label, x + 12, y + (h - 16) / 2 + 2);
+
+  // --- Name (bold), top of cell ---
+  int nameH = 18;
+  M5.Display.setFont(FONT_NAME);
+  M5.Display.setTextColor(T.hasPass ? quality : COL_FG);
+  int tw = M5.Display.textWidth(T.name);
+  if (tw > innerW) tw = innerW;      // (centering still fine if it's wide)
+  M5.Display.drawString(T.name, originX + cellW/2 - M5.Display.textWidth(T.name)/2, originY + PAD);
   M5.Display.setTextColor(COL_FG);
-}
+  M5.Display.setFont(FONT_BODY);
 
-// Hint bar drawn at the very bottom of every screen so the button mapping for the
-// current context is always visible (the buttons themselves are unlabeled).
-void drawButtonHints(const char* a, const char* b, const char* c) {
-  int y = SCR_H - 22;
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(COL_FG);
-  M5.Display.drawFastHLine(0, y - 4, SCR_W, COL_FG);
-  char line[64];
-  snprintf(line, sizeof(line), "A:%s   B:%s   C:%s", a, b, c);
-  M5.Display.drawString(line, 8, y + 2);
-}
+  // --- No-data cases: skip the (meaningless) empty plot and show a centered
+  //     message well clear of the name. This avoids drawing text over the plot. ---
+  if (!T.haveTLE || !T.hasPass) {
+    const char* msg = !T.haveTLE ? "no orbital data" : "no pass found";
+    M5.Display.setFont(FONT_BODY);
+    M5.Display.setTextColor(!T.haveTLE ? COL_LOS : COL_GRID);
+    int mw = M5.Display.textWidth(msg);
+    int my = originY + cellH / 2 - 8;          // vertically centered in the cell
+    M5.Display.drawString(msg, originX + cellW/2 - mw/2, my);
+    M5.Display.setTextColor(COL_FG);
+    return;
+  }
 
-// ====================== SATELLITE ICON ======================
-void drawSatelliteIcon(int x, int y, int size) {
-  M5.Display.fillRect(x - size/2, y - size/2, size, size, COL_ACCENT);
-}
+  // --- Polar plot, centered, sized to leave room for the 3-line text block ---
+  // Reserve space: name (PAD+nameH+Nlabel), plot (2r), S label, gap, text, PAD.
+  int textBlockH = 3 * LINE_H + 4;
+  int topUsed = PAD + nameH + 18;            // down to where the plot circle's top sits (incl. N label)
+  int avail   = cellH - topUsed - 14 /*S label*/ - 6 /*gap*/ - textBlockH - PAD;
+  int r = avail / 2;
+  if (r > 58) r = 58;                        // cap so plots aren't huge
+  if (r < 34) r = 34;                        // floor so they're still readable
+  int cx = originX + cellW / 2;
+  int cy = originY + topUsed + r;
 
-// ====================== MAIN SCREEN (portrait 400x600) ======================
-// Focusable items: 0=Refresh, 1=Select Sat, 2=Setup.
-void drawMainScreen() {
-  itemCount = 3;
-  if (selIndex < 0) selIndex = 0;
-  if (selIndex >= itemCount) selIndex = itemCount - 1;
-
-  M5.Display.clearDisplay();
-  M5.Display.fillScreen(COL_BG);
-  M5.Display.setTextColor(COL_FG);
-
-  // --- Header ---
-  M5.Display.setTextSize(2);
-  M5.Display.drawString("PaperSatColor", 12, 8);
-  M5.Display.setTextColor(sat.satEl > 0 ? COL_ACCENT : COL_FG);
-  M5.Display.drawString(selectedName.c_str(), 12, 34);
-  M5.Display.setTextColor(COL_FG);
-
-  // Time + battery on the header's right side
-  M5.Display.setTextSize(1);
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-  char ts[20];
-  sprintf(ts, "%02d:%02d UTC", timeinfo.tm_hour, timeinfo.tm_min);
-  M5.Display.drawString(ts, 250, 10);
-  char bat[10];
-  sprintf(bat, "%d%%", getBatteryPercent());
-  M5.Display.drawString(bat, 250, 26);
-
-  // --- Polar plot (centered, upper area) ---
-  int cx = SCR_W / 2, cy = 230, r = 150;
+  // Graticule with soft yellow "good elevation" fill inside the 45-deg ring.
+  M5.Display.fillCircle(cx, cy, r/2, COL_RINGFILL);
   M5.Display.drawCircle(cx, cy, r, COL_FG);
-  M5.Display.drawCircle(cx, cy, r/2, COL_FG);
-  M5.Display.drawCircle(cx, cy, 12, COL_FG);
-
-  for (int i = 0; i < 8; i++) {
-    float angle = i * 45.0 * PI / 180.0;
-    int x1 = cx + (int)(r * 0.2 * sin(angle));
-    int y1 = cy - (int)(r * 0.2 * cos(angle));
-    int x2 = cx + (int)(r * sin(angle));
-    int y2 = cy - (int)(r * cos(angle));
-    M5.Display.drawLine(x1, y1, x2, y2, COL_FG);
+  M5.Display.drawCircle(cx, cy, r/2, COL_GRID);
+  M5.Display.fillCircle(cx, cy, 2, COL_FG);
+  for (int a = 0; a < 360; a += 90) {
+    float rad = a * PI / 180.0;
+    M5.Display.drawLine(cx, cy, cx + (int)(r*sin(rad)), cy - (int)(r*cos(rad)), COL_GRID);
   }
-
-  M5.Display.setTextSize(1);
-  M5.Display.drawString("N", cx-3, cy-r-14);
-  M5.Display.drawString("S", cx-3, cy+r+5);
-  M5.Display.drawString("E", cx+r+8, cy-3);
-  M5.Display.drawString("W", cx-r-14, cy-3);
-
-  // Determine which pass to plot
-  int passToPlot = -1;
-  if (passCount > 0) {
-    time_t now = time(nullptr);
-    if (sat.satEl > 0) {
-      for (int i = 0; i < passCount; i++) {
-        if (passes[i].aos <= now && passes[i].los >= now) { passToPlot = i; break; }
-      }
-    } else {
-      passToPlot = 0;
-    }
-  }
-
-  // Pass arc (blue)
-  if (passToPlot >= 0) {
-    time_t startT = passes[passToPlot].aos;
-    time_t endT = passes[passToPlot].los;
-    long duration = endT - startT;
-    if (duration > 0) {
-      const int numPoints = 36;
-      long step = duration / (numPoints - 1);
-      if (step < 15) step = 15;
-      int prevX = -1, prevY = -1;
-      double savedAz = sat.satAz;
-      double savedEl = sat.satEl;
-      for (int i = 0; i < numPoints; i++) {
-        time_t t = startT + (long)i * step;
-        if (t > endT) t = endT;
-        sat.findsat((unsigned long)t);
-        if (sat.satEl > 0.0) {
-          double az = sat.satAz * PI / 180.0;
-          double eln = (90.0 - sat.satEl) / 90.0;
-          int px = cx + (int)(r * eln * sin(az));
-          int py = cy - (int)(r * eln * cos(az));
-          if (prevX >= 0) M5.Display.drawLine(prevX, prevY, px, py, COL_PATH);
-          prevX = px; prevY = py;
-        } else {
-          prevX = -1;
-        }
-      }
-      sat.satAz = savedAz;
-      sat.satEl = savedEl;
-    }
-  }
-
-  // Current satellite position (red) + direction arrow
-  if (sat.satEl > 0) {
-    double az = sat.satAz * PI / 180.0;
-    double eln = (90.0 - sat.satEl) / 90.0;
-    int px = cx + (int)(r * eln * sin(az));
-    int py = cy - (int)(r * eln * cos(az));
-    drawSatelliteIcon(px, py, 14);
-
-    time_t nowT = time(nullptr);
-    time_t futureT = nowT + 45;
-    if (passToPlot >= 0 && passes[passToPlot].los < futureT + 10) {
-      futureT = passes[passToPlot].los - 5;
-    }
-    if (futureT > nowT + 5) {
-      double savedAz2 = sat.satAz;
-      double savedEl2 = sat.satEl;
-      sat.findsat((unsigned long)futureT);
-      if (sat.satEl > 0.0) {
-        double azf = sat.satAz * PI / 180.0;
-        double elnf = (90.0 - sat.satEl) / 90.0;
-        int pxf = cx + (int)(r * elnf * sin(azf));
-        int pyf = cy - (int)(r * elnf * cos(azf));
-        int dx = pxf - px;
-        int dy = pyf - py;
-        double len = sqrt(dx * dx + dy * dy);
-        if (len > 3.0) {
-          double scale = 20.0 / len;
-          int ax = px + (int)(dx * scale);
-          int ay = py + (int)(dy * scale);
-          M5.Display.drawLine(px, py, ax, ay, COL_ACCENT);
-          double angle = atan2(dy, dx);
-          double asz = 9.0;
-          int hx1 = ax - (int)(asz * cos(angle - 0.4));
-          int hy1 = ay - (int)(asz * sin(angle - 0.4));
-          int hx2 = ax - (int)(asz * cos(angle + 0.4));
-          int hy2 = ay - (int)(asz * sin(angle + 0.4));
-          M5.Display.drawLine(ax, ay, hx1, hy1, COL_ACCENT);
-          M5.Display.drawLine(ax, ay, hx2, hy2, COL_ACCENT);
-        }
-      }
-      sat.satAz = savedAz2;
-      sat.satEl = savedEl2;
-    }
-  }
-
-  // --- Az / El line below the plot ---
-  M5.Display.setTextSize(1);
-  int infoY = cy + r + 16;
-  char buf[32];
-  sprintf(buf, "Az: %.1f", sat.satAz);
-  M5.Display.drawString(buf, 12, infoY);
-  int x = 12 + M5.Display.textWidth(buf);
-  drawDegreeSymbol(x, infoY);
-  sprintf(buf, "   El: %.1f", sat.satEl);
-  x += 12;
-  M5.Display.drawString(buf, x, infoY);
-  x += M5.Display.textWidth(buf);
-  drawDegreeSymbol(x, infoY);
-
-  // --- Next passes ---
-  int passY = infoY + 20;
-  M5.Display.drawString("Next Passes (UTC):", 12, passY);
-  for (int i = 0; i < passCount && i < 3; i++) {
-    struct tm aos_tm = *gmtime(&passes[i].aos);
-    struct tm los_tm = *gmtime(&passes[i].los);
-    char line[80];
-    sprintf(line, "%02d:%02d:%02d > %02d:%02d:%02d  %.0f",
-            aos_tm.tm_hour, aos_tm.tm_min, aos_tm.tm_sec,
-            los_tm.tm_hour, los_tm.tm_min, los_tm.tm_sec, passes[i].maxEl);
-    M5.Display.drawString(line, 12, passY + 16 + i*15);
-    int px = 12 + M5.Display.textWidth(line);
-    drawDegreeSymbol(px, passY + 16 + i*15);
-  }
-
-  // --- Status + GP timestamp ---
-  int statusY = passY + 16 + 3*15 + 6;
-  if (lastTLETime > TLE_TIME_VALID_THRESHOLD) {
-    struct tm t = *gmtime(&lastTLETime);
-    char tleStr[50];
-    sprintf(tleStr, "GP %02d/%02d %02d:%02dz",
-            t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
-    M5.Display.drawString(tleStr, 12, statusY);
-  }
-  M5.Display.drawString(statusMsg.c_str(), 12, statusY + 14);
-
-  // --- Action row (3 items, highlighted by selIndex) ---
-  int btnY = SCR_H - 70;
-  int bw = (SCR_W - 4*8) / 3;   // three across with 8px gutters
-  drawMenuItem(8 + 0*(bw+8), btnY, bw, 40, "Refresh",  selIndex == 0);
-  drawMenuItem(8 + 1*(bw+8), btnY, bw, 40, "Sat List", selIndex == 1);
-  drawMenuItem(8 + 2*(bw+8), btnY, bw, 40, "Setup",    selIndex == 2);
-
-  drawButtonHints("Prev", "Select", "Next");
-  M5.Display.display();
-}
-
-// ====================== OTHER SCREENS ======================
-// SAT_SELECT focusable items: 0..numOnPage-1 = sat rows on this page;
-// then the action buttons: [Prev][Next][Update GP][Back] (Prev/Next only
-// present when there are multiple pages, but kept in the index space for
-// simplicity and skipped on activation when not applicable).
-// Helper exposes how many sat rows are on the current page.
-int satSelectNumOnPage() {
-  int startIdx = currentSatPage * satsPerPage;
-  int remaining = satCount - startIdx;
-  if (remaining < 0) remaining = 0;
-  return (satsPerPage < remaining ? satsPerPage : remaining);
-}
-
-void drawSatSelectScreen() {
-  int numOnPage = satSelectNumOnPage();
-  int totalPages = (satCount + satsPerPage - 1) / satsPerPage;
-  if (totalPages < 1) totalPages = 1;
-
-  // Item layout: sat rows + 4 actions (Prev, Next, Update GP, Back).
-  itemCount = numOnPage + 4;
-  if (selIndex < 0) selIndex = 0;
-  if (selIndex >= itemCount) selIndex = itemCount - 1;
-
-  M5.Display.clearDisplay();
-  M5.Display.fillScreen(COL_BG);
+  M5.Display.setFont(FONT_BODY);
   M5.Display.setTextColor(COL_FG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString("Select Satellite", 12, 8);
-  M5.Display.setTextSize(1);
-  char pageStr[20];
-  sprintf(pageStr, "Page %d/%d", currentSatPage + 1, totalPages);
-  M5.Display.drawString(pageStr, 280, 14);
+  M5.Display.drawString("N", cx - 4,     cy - r - 15);
+  M5.Display.drawString("S", cx - 4,     cy + r + 1);
+  M5.Display.drawString("E", cx + r + 4, cy - 8);
+  M5.Display.drawString("W", cx - r - 14, cy - 8);
 
-  int startIdx = currentSatPage * satsPerPage;
-  for (int j = 0; j < numOnPage; j++) {
-    int i = startIdx + j;
-    int y = 40 + j * 34;
-    drawMenuItem(12, y, SCR_W - 24, 30, satList[i].name, selIndex == j);
-  }
+  int textY = cy + r + 18;           // below the S label (S glyph spans cy+r+1 .. +17)
 
-  // Action row: two columns x two rows below the list.
-  int aY = 40 + 10 * 34 + 8;   // below max-height list (10 rows)
-  int aw = (SCR_W - 3*8) / 2;
-  int prevIdx   = numOnPage + 0;
-  int nextIdx   = numOnPage + 1;
-  int updateIdx = numOnPage + 2;
-  int backIdx   = numOnPage + 3;
-  drawMenuItem(8,            aY,      aw, 36, "< Prev Page", selIndex == prevIdx);
-  drawMenuItem(8 + aw + 8,   aY,      aw, 36, "Next Page >", selIndex == nextIdx);
-  drawMenuItem(8,            aY + 44, aw, 36, "Update GP",   selIndex == updateIdx);
-  drawMenuItem(8 + aw + 8,   aY + 44, aw, 36, "Back",        selIndex == backIdx);
-
-  drawButtonHints("Prev", "Select", "Next");
-  M5.Display.display();
-}
-
-void drawSetupMenu() {
-  itemCount = 6;  // 5 options + Back
-  if (selIndex < 0) selIndex = 0;
-  if (selIndex >= itemCount) selIndex = itemCount - 1;
-
-  M5.Display.clearDisplay();
-  M5.Display.fillScreen(COL_BG);
-  M5.Display.setTextColor(COL_FG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString("Setup", 12, 8);
-  M5.Display.setTextSize(1);
-
-  const char* labels[] = {
-    "Enter Maidenhead Grid",
-    "Enter Lat / Lon",
-    "WiFi Configuration",
-    "Auto Location via WiFi",
-    "Set Time/Date (UTC)",
-    "Back"
+  // Helper to map an az/el sample to a screen point on the polar plot.
+  auto polar = [&](float azDeg, float elDeg, int &ox, int &oy) {
+    float az = azDeg * PI / 180.0;
+    float eln = (90.0 - elDeg) / 90.0;
+    ox = cx + (int)(r * eln * sin(az));
+    oy = cy - (int)(r * eln * cos(az));
   };
-  for (int i = 0; i < 6; i++) {
-    int y = 48 + i * 50;
-    drawMenuItem(12, y, SCR_W - 24, 40, labels[i], selIndex == i);
+
+  // Pass arc (blue), 2px thick.
+  int px = -1, py = -1;
+  for (int k = 0; k < T.arcN; k++) {
+    int x, y; polar(T.arcAz[k], T.arcEl[k], x, y);
+    if (px >= 0) {
+      M5.Display.drawLine(px, py, x, y, COL_PATH);
+      M5.Display.drawLine(px, py + 1, x, y + 1, COL_PATH);
+    }
+    px = x; py = y;
+  }
+  // AOS (green) and LOS (red) endpoints.
+  if (T.arcN > 0) {
+    int ax, ay, lx, ly;
+    polar(T.arcAz[0], T.arcEl[0], ax, ay);
+    polar(T.arcAz[T.arcN - 1], T.arcEl[T.arcN - 1], lx, ly);
+    M5.Display.fillCircle(ax, ay, 4, COL_AOS); M5.Display.drawCircle(ax, ay, 4, COL_FG);
+    M5.Display.fillCircle(lx, ly, 4, COL_LOS); M5.Display.drawCircle(lx, ly, 4, COL_FG);
+  }
+  // Peak marker (red) at the highest sampled point.
+  {
+    int bestK = 0; float bestEl = -1;
+    for (int k = 0; k < T.arcN; k++) if (T.arcEl[k] > bestEl) { bestEl = T.arcEl[k]; bestK = k; }
+    if (T.arcN > 0) { int hx, hy; polar(T.arcAz[bestK], T.arcEl[bestK], hx, hy); M5.Display.fillCircle(hx, hy, 3, COL_PEAK); }
   }
 
-  drawButtonHints("Prev", "Select", "Next");
-  M5.Display.display();
+  // --- Text block ---
+  struct tm a = *gmtime(&T.aos);
+  struct tm l = *gmtime(&T.los);
+  char line[40];
+  time_t now = time(nullptr);
+  bool nowUp = (T.aos <= now && now <= T.los);
+
+  // "in progress" badge replaces the date area on the AOS line if active.
+  M5.Display.setTextColor(COL_AOS);
+  sprintf(line, "AOS %02d:%02d Az%.0f", a.tm_hour, a.tm_min, T.aosAz);
+  M5.Display.drawString(line, innerX, textY);
+  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY);
+
+  M5.Display.setTextColor(COL_LOS);
+  sprintf(line, "LOS %02d:%02d Az%.0f", l.tm_hour, l.tm_min, T.losAz);
+  M5.Display.drawString(line, innerX, textY + LINE_H);
+  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY + LINE_H);
+
+  M5.Display.setTextColor(quality);
+  sprintf(line, "Max El %.0f", T.maxEl);
+  M5.Display.drawString(line, innerX, textY + 2 * LINE_H);
+  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY + 2 * LINE_H);
+
+  // Right side of the Max-El line: date, or "NOW" badge if a pass is happening.
+  if (nowUp) {
+    M5.Display.setTextColor(COL_NOW);
+    const char* nb = "NOW";
+    M5.Display.drawString(nb, originX + cellW - PAD - M5.Display.textWidth(nb), textY + 2 * LINE_H);
+  } else {
+    M5.Display.setTextColor(COL_GRID);
+    sprintf(line, "%02d/%02d", a.tm_mon + 1, a.tm_mday);
+    M5.Display.drawString(line, originX + cellW - PAD - M5.Display.textWidth(line), textY + 2 * LINE_H);
+  }
+  M5.Display.setTextColor(COL_FG);
 }
 
-// ---- Shared character-scroll text-entry renderer ----
-// Shows the prompt, the buffer being built, and a big "wheel" of characters with
-// the one at charCursor highlighted. The set includes <DEL> and <DONE> as the
-// final two scrollable entries so all editing is reachable with A/C scroll + B.
-void drawCharEntry(const char* prompt, const char* prompt2, const char* charset) {
-  M5.Display.clearDisplay();
+void drawDashboard() {
+  M5.Display.waitDisplay();
+  M5.Display.startWrite();
   M5.Display.fillScreen(COL_BG);
+
+  // ----- Header bar -----  (TOP_MARGIN keeps text off the bezel)
+  const int TOP_MARGIN = 6;
+  M5.Display.setFont(FONT_BODY);
+  struct tm ti; bool haveTime = getLocalTime(&ti);
+  char hdr[48];
+  if (haveTime) sprintf(hdr, "%02d:%02d UTC", ti.tm_hour, ti.tm_min);
+  else strcpy(hdr, "--:-- UTC");
+  M5.Display.setTextColor(COL_FG);
+  M5.Display.drawString(hdr, 8, TOP_MARGIN);
+
+  // IP address (blue) centered.
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("offline");
+  int ipw = M5.Display.textWidth(ip.c_str());
+  M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? COL_HDR : COL_LOS);
+  M5.Display.drawString(ip.c_str(), SCR_W/2 - ipw/2, TOP_MARGIN);
+
+  // Battery.
+  int batPct = getBatteryPercent();
+  char bat[8]; sprintf(bat, "%d%%", batPct);
+  int bw = M5.Display.textWidth(bat);
+  int batCol = (batPct >= 50) ? COL_AOS : (batPct >= 20) ? COL_HDR : COL_LOS;
+  M5.Display.setTextColor(batCol);
+  M5.Display.drawString(bat, SCR_W - bw - 8, TOP_MARGIN);
   M5.Display.setTextColor(COL_FG);
 
-  M5.Display.setTextSize(1);
-  M5.Display.drawString(prompt, 12, 12);
-  if (prompt2 && prompt2[0]) M5.Display.drawString(prompt2, 12, 28);
+  // ----- 2x2 grid of cells -----
+  const int headerH = 30;            // header band height (text + rule + gap)
+  const int footerH = 26;            // footer band height (legend + bottom margin)
+  M5.Display.drawFastHLine(8, headerH - 4, SCR_W - 16, COL_HDR);  // inset rule
 
-  // Current buffer
-  M5.Display.setTextSize(3);
-  M5.Display.drawString(inputBuffer.length() ? inputBuffer.c_str() : "_", 16, 60);
-  M5.Display.setTextSize(1);
+  int gridTop = headerH;
+  int gridH = SCR_H - headerH - footerH;
+  int cellW = SCR_W / 2;
+  int cellH = gridH / 2;
 
-  // Build the full selectable list = charset chars + DEL + DONE.
-  int n = strlen(charset);
-  int total = n + 2;            // + DEL + DONE
-  itemCount = total;           // handleButtons scrolls over this range
-  if (charCursor < 0) charCursor = total - 1;
-  if (charCursor >= total) charCursor = 0;
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    int col = i % 2;
+    int row = i / 2;
+    int ox = col * cellW;
+    int oy = gridTop + row * cellH;
+    drawCell(i, ox, oy, cellW, cellH);
+  }
+  // grid dividers (inset from the edges so they don't touch the bezel)
+  M5.Display.drawFastVLine(cellW, gridTop + 4, gridH - 8, COL_GRID);
+  M5.Display.drawFastHLine(8, gridTop + cellH, SCR_W - 16, COL_GRID);
 
-  // Render a horizontal wheel of ~7 entries centered on charCursor.
-  int midX = SCR_W / 2;
-  int cellW = 54;
-  int wheelY = 200;
-  M5.Display.drawString("Character:", 12, wheelY - 26);
-  for (int off = -3; off <= 3; off++) {
-    int idx = ((charCursor + off) % total + total) % total;
-    char label[8];
-    if (idx < n)            { label[0] = charset[idx]; label[1] = '\0'; }
-    else if (idx == n)      strcpy(label, "DEL");
-    else                    strcpy(label, "OK");
-    int cxCell = midX + off * cellW;
-    bool sel = (off == 0);
-    int cw = sel ? 48 : 40;
-    int ch = sel ? 54 : 44;
-    int cy = wheelY + (sel ? 0 : 6);
-    if (sel) {
-      M5.Display.fillRoundRect(cxCell - cw/2, cy, cw, ch, 6, COL_HILITE);
-      M5.Display.setTextColor(COL_BG);
-      M5.Display.setTextSize(idx < n ? 3 : 2);
-    } else {
-      M5.Display.drawRoundRect(cxCell - cw/2, cy, cw, ch, 6, COL_FG);
-      M5.Display.setTextColor(COL_FG);
-      M5.Display.setTextSize(idx < n ? 2 : 1);
+  // ----- Footer: compact legend on the left, status on the right (clipped) -----
+  int footTop = SCR_H - footerH;
+  M5.Display.drawFastHLine(8, footTop + 2, SCR_W - 16, COL_HDR);
+  int fy = footTop + 7;
+  M5.Display.setFont(FONT_BODY);
+
+  // Minimal legend: just the two endpoint markers (the El colors are obvious
+  // from the cells themselves, and crowding the footer caused overruns).
+  M5.Display.fillCircle(10, fy + 7, 3, COL_AOS);
+  M5.Display.setTextColor(COL_FG);
+  M5.Display.drawString("rise", 18, fy);
+  M5.Display.fillCircle(58, fy + 7, 3, COL_LOS);
+  M5.Display.drawString("set", 66, fy);
+
+  // Status message: right-aligned region, truncated with an ellipsis so it can
+  // never run past the screen edge or collide with the legend.
+  int statusX = 100;                       // legend ends ~94px
+  int statusMaxW = SCR_W - 8 - statusX;     // available width to the right margin
+  String st = statusMsg;
+  // Trim characters until it fits the available width.
+  while (st.length() > 1 && M5.Display.textWidth(st.c_str()) > statusMaxW) {
+    st = st.substring(0, st.length() - 1);
+  }
+  if (st.length() < statusMsg.length() && st.length() > 1) {
+    st = st.substring(0, st.length() - 1) + ".";   // mark truncation
+  }
+  M5.Display.setTextColor(COL_FG);
+  int stw = M5.Display.textWidth(st.c_str());
+  M5.Display.drawString(st.c_str(), SCR_W - 8 - stw, fy);   // right-aligned
+
+  M5.Display.endWrite();
+  M5.Display.display();   // single full refresh
+}
+
+// ====================== CONFIG WEB SERVER ======================
+// Serves a page with four <select> dropdowns (populated from the AMSAT catalog)
+// and station location fields. Saving persists config, refetches/recomputes, and
+// requests one redraw. All configuration happens here - there is no on-device UI.
+void handleRoot() {
+  String html;
+  html.reserve(8000);
+  html += "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
+  html += "<title>PaperSatColor Setup</title><style>";
+  html += "body{font-family:sans-serif;margin:16px;max-width:640px}";
+  html += "h1{font-size:1.3em}label{display:block;margin:10px 0 3px;font-weight:bold}";
+  html += "select,input{width:100%;padding:6px;font-size:1em}";
+  html += "button{margin-top:16px;padding:10px 18px;font-size:1em}";
+  html += ".row{display:flex;gap:10px}.row>div{flex:1}</style></head><body>";
+  html += "<h1>PaperSatColor</h1><p>Choose four satellites to track. Catalog: ";
+  html += String(satCount) + " satellites from the AMSAT bulletin.</p>";
+  html += "<form method=POST action=/save>";
+
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    html += "<label>Slot " + String(i + 1) + "</label><select name=n" + String(i) + ">";
+    // current selection first (in case it isn't in the catalog list)
+    bool found = false;
+    for (int j = 0; j < satCount; j++) {
+      bool sel = (strcmp(satList[j].norad, tracked[i].norad) == 0);
+      if (sel) found = true;
+      html += "<option value='" + String(satList[j].norad) + "'";
+      if (sel) html += " selected";
+      html += ">" + String(satList[j].name) + " (" + String(satList[j].norad) + ")</option>";
     }
-    int tw = M5.Display.textWidth(label);
-    M5.Display.drawString(label, cxCell - tw/2, cy + ch/2 - 10);
-    M5.Display.setTextColor(COL_FG);
-    M5.Display.setTextSize(1);
-  }
-
-  drawButtonHints("Prev char", "Pick", "Next char");
-  M5.Display.display();
-}
-
-void drawGridInputScreen() {
-  drawCharEntry("Enter Maidenhead Grid (4 or 6 chars).",
-                "Scroll to OK to confirm, DEL to erase.", GRID_CHARS);
-}
-
-void drawLatLonInputScreen() {
-  drawCharEntry("Enter Lat,Lon  e.g. 40.7128,-74.0060",
-                "Scroll to OK to confirm, DEL to erase.", LATLON_CHARS);
-}
-
-void drawTimeInputScreen() {
-  drawCharEntry("Set UTC: YYYY-MM-DD HH:MM:SS (or T sep)",
-                "Scroll to OK to confirm, DEL to erase.", TIME_CHARS);
-}
-
-// ---- Commit handlers (shared by the entry screens' OK action) ----
-void commitGrid() {
-  if (inputBuffer.length() >= 4) gridToLatLon(inputBuffer.c_str(), qth_lat, qth_lon);
-  saveConfig();
-}
-
-void commitLatLon() {
-  if (inputBuffer.length() > 0) {
-    int comma = inputBuffer.indexOf(',');
-    if (comma > 0) {
-      qth_lat = inputBuffer.substring(0, comma).toDouble();
-      qth_lon = inputBuffer.substring(comma + 1).toDouble();
-      saveConfig();
+    if (!found) {
+      html += "<option value='" + String(tracked[i].norad) + "' selected>" +
+              String(tracked[i].name) + " (" + String(tracked[i].norad) + ")</option>";
     }
+    html += "</select>";
   }
+
+  char lats[16], lons[16], alts[16];
+  dtostrf(qth_lat, 0, 4, lats);
+  dtostrf(qth_lon, 0, 4, lons);
+  dtostrf(qth_alt, 0, 1, alts);
+  html += "<label>Station location</label><div class=row>";
+  html += "<div><input name=lat value='" + String(lats) + "' placeholder='lat'></div>";
+  html += "<div><input name=lon value='" + String(lons) + "' placeholder='lon'></div>";
+  html += "<div><input name=alt value='" + String(alts) + "' placeholder='alt m'></div></div>";
+  html += "<p><small>Or enter a Maidenhead grid (overrides lat/lon if 4+ chars):</small>";
+  html += "<input name=grid placeholder='e.g. FM18lv'></p>";
+
+  html += "<button type=submit>Save &amp; Refresh</button>";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
 }
 
-void commitTime() {
-  int y, m, d, h, mi, s = 0;
-  int nn = sscanf(inputBuffer.c_str(), "%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &mi, &s);
-  if (nn < 6) nn = sscanf(inputBuffer.c_str(), "%d-%d-%dT%d:%d:%d", &y, &m, &d, &h, &mi, &s);
-  if (nn < 6) { nn = sscanf(inputBuffer.c_str(), "%d-%d-%d %d:%d", &y, &m, &d, &h, &mi); if (nn == 5) s = 0; }
-  if (nn >= 5 && y >= 2020 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 &&
-      h >= 0 && h <= 23 && mi >= 0 && mi <= 59 && s >= 0 && s <= 59) {
-    setSystemTime(y, m, d, h, mi, s);
-    statusMsg = "Time set successfully (UTC)";
-  } else {
-    statusMsg = "Invalid format. Use YYYY-MM-DD HH:MM:SS";
-  }
-}
-
-
-// ====================== SCREEN DISPATCH ======================
-void redrawCurrent() {
-  switch (currentScreen) {
-    case MAIN:         drawMainScreen();        break;
-    case SAT_SELECT:   drawSatSelectScreen();   break;
-    case SETUP_MENU:   drawSetupMenu();         break;
-    case GRID_INPUT:   drawGridInputScreen();   break;
-    case LATLON_INPUT: drawLatLonInputScreen(); break;
-    case TIME_INPUT:   drawTimeInputScreen();   break;
-  }
-}
-
-// Reset navigation state when entering a screen.
-void enterScreen(Screen s) {
-  currentScreen = s;
-  selIndex = 0;
-  charCursor = 0;
-  redrawCurrent();
-}
-
-// ====================== BUTTON HANDLER ======================
-// BtnA = Prev/Up, BtnC = Next/Down, BtnB = Select (short) / Back (long-hold).
-// Each branch performs the action and redraws exactly once (every redraw is a
-// slow full EPD refresh, so we never redraw more than necessary per press).
-void handleButtons() {
-  bool up    = M5.BtnA.wasClicked();
-  bool down  = M5.BtnC.wasClicked();
-  bool sel   = M5.BtnB.wasClicked();
-  bool back  = M5.BtnB.wasHold();   // long-press B = Back
-
-  if (!up && !down && !sel && !back) return;
-
-  // ---------- Text-entry screens use the char wheel ----------
-  if (currentScreen == GRID_INPUT || currentScreen == LATLON_INPUT || currentScreen == TIME_INPUT) {
-    const char* charset = (currentScreen == GRID_INPUT) ? GRID_CHARS
-                        : (currentScreen == LATLON_INPUT) ? LATLON_CHARS : TIME_CHARS;
-    int n = strlen(charset);
-    int total = n + 2;  // + DEL + OK
-
-    if (back) { enterScreen(SETUP_MENU); return; }
-    if (up)   { charCursor = (charCursor - 1 + total) % total; redrawCurrent(); return; }
-    if (down) { charCursor = (charCursor + 1) % total; redrawCurrent(); return; }
-    if (sel) {
-      if (charCursor < n) {                       // append a real character
-        size_t cap = (currentScreen == GRID_INPUT) ? 6 : 19;
-        if (inputBuffer.length() < cap) inputBuffer += charset[charCursor];
-        redrawCurrent();
-      } else if (charCursor == n) {               // DEL
-        if (inputBuffer.length() > 0) inputBuffer.remove(inputBuffer.length() - 1);
-        redrawCurrent();
-      } else {                                    // OK -> commit + return to MAIN
-        if (currentScreen == GRID_INPUT)   commitGrid();
-        else if (currentScreen == LATLON_INPUT) commitLatLon();
-        else                                commitTime();
-        currentScreen = MAIN; selIndex = 0;
-        updateData();
-        drawMainScreen();
-      }
-      return;
-    }
-    return;
-  }
-
-  // ---------- Menu/list screens use selIndex ----------
-  if (up)   { selIndex = (selIndex - 1 + itemCount) % itemCount; redrawCurrent(); return; }
-  if (down) { selIndex = (selIndex + 1) % itemCount; redrawCurrent(); return; }
-
-  if (currentScreen == MAIN) {
-    if (back) return;  // already at top level
-    if (sel) {
-      if (selIndex == 0)      { updateData(); drawMainScreen(); }
-      else if (selIndex == 1) { currentSatPage = 0; enterScreen(SAT_SELECT); }
-      else                    { enterScreen(SETUP_MENU); }
-    }
-    return;
-  }
-
-  if (currentScreen == SAT_SELECT) {
-    if (back) { enterScreen(MAIN); return; }
-    if (sel) {
-      int numOnPage = satSelectNumOnPage();
-      int totalPages = (satCount + satsPerPage - 1) / satsPerPage;
-      if (totalPages < 1) totalPages = 1;
-      if (selIndex < numOnPage) {                 // pick a satellite
-        int i = currentSatPage * satsPerPage + selIndex;
-        selectedName = satList[i].name;
-        selectedNorad = satList[i].norad;
-        saveConfig();
-        currentTLE1[0] = '\0';
-        currentTLE2[0] = '\0';
-        currentScreen = MAIN; selIndex = 0;
-        updateData();
-        drawMainScreen();
-      } else {
-        int action = selIndex - numOnPage;        // 0=Prev,1=Next,2=Update,3=Back
-        if (action == 0) {                        // Prev page
-          if (currentSatPage > 0) { currentSatPage--; selIndex = 0; }
-          drawSatSelectScreen();
-        } else if (action == 1) {                 // Next page
-          if (currentSatPage < totalPages - 1) { currentSatPage++; selIndex = 0; }
-          drawSatSelectScreen();
-        } else if (action == 2) {                 // Update GP
-          forceTLEUpdate = true;
-          updateData();
-          drawSatSelectScreen();
-        } else {                                  // Back
-          enterScreen(MAIN);
+void handleSave() {
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    String arg = "n" + String(i);
+    if (server.hasArg(arg)) {
+      String norad = server.arg(arg);
+      norad.toCharArray(tracked[i].norad, sizeof(tracked[i].norad));
+      // resolve display name from catalog
+      for (int j = 0; j < satCount; j++) {
+        if (norad == satList[j].norad) {
+          strncpy(tracked[i].name, satList[j].name, sizeof(tracked[i].name));
+          tracked[i].name[sizeof(tracked[i].name)-1] = '\0';
+          break;
         }
       }
+      tracked[i].haveTLE = false;  // force rebuild from bulletin
     }
-    return;
   }
+  if (server.hasArg("grid") && server.arg("grid").length() >= 4) {
+    char g[12];
+    server.arg("grid").toCharArray(g, sizeof(g));
+    gridToLatLon(g, qth_lat, qth_lon);
+  } else {
+    if (server.hasArg("lat")) qth_lat = server.arg("lat").toDouble();
+    if (server.hasArg("lon")) qth_lon = server.arg("lon").toDouble();
+  }
+  if (server.hasArg("alt")) qth_alt = server.arg("alt").toDouble();
 
-  if (currentScreen == SETUP_MENU) {
-    if (back) { enterScreen(MAIN); return; }
-    if (sel) {
-      switch (selIndex) {
-        case 0: inputBuffer = ""; enterScreen(GRID_INPUT);   break;
-        case 1: inputBuffer = ""; enterScreen(LATLON_INPUT); break;
-        case 2: openSetupPortal();                            break;
-        case 3: autoLocateViaWiFi(); enterScreen(MAIN);       break;
-        case 4: inputBuffer = ""; enterScreen(TIME_INPUT);    break;
-        case 5: enterScreen(MAIN);                            break;
-      }
-    }
-    return;
-  }
+  saveConfig();
+
+  // Respond immediately, then apply (the apply path does a slow EPD refresh).
+  server.send(200, "text/html",
+    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:sans-serif;margin:24px'>"
+    "<h2>Saved.</h2><p>The display will refresh in ~20s.</p>"
+    "<p><a href='/'>Back to setup</a></p></body>");
+
+  forceTLEUpdate = true;     // pull fresh elements for newly chosen sats
+  fetchBulletin();
+  recomputeAllPasses();
+  needsRedraw = true;
 }
 
-void openSetupPortal() {
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(300);
-  M5.Display.clearDisplay();
+void startConfigServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+// ====================== SETUP / LOOP ======================
+void setup() {
+  M5.begin();                          // M5Unified does NOT probe SD by default
+  M5.Display.setRotation(0);          // portrait 400x600 (use 2 if upside down)
+  M5.Display.setAutoDisplay(false);   // EPD: accumulate drawing, push once via display()
+  M5.Display.setTextDatum(top_left);  // drawString y = top of glyph (matches layout math)
+  M5.Display.setFont(FONT_BODY);
+
+  // Boot splash (single refresh).
+  M5.Display.startWrite();
   M5.Display.fillScreen(COL_BG);
+  M5.Display.setFont(&fonts::FreeSansBold18pt7b);
+  M5.Display.setTextColor(COL_HDR);
+  M5.Display.drawString("PaperSatColor", 12, 36);
+  M5.Display.setFont(FONT_BODY);
   M5.Display.setTextColor(COL_FG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString("WiFi Setup Portal", 20, 30);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString("Connect to: M5PaperColor-Setup", 20, 80);
-  M5.Display.drawString("Then open 192.168.4.1 in browser", 20, 110);
-  M5.Display.drawString("Portal times out after 5 minutes", 20, 150);
+  M5.Display.drawString("Starting up...", 12, 80);
+  M5.Display.drawString("Connecting WiFi, loading orbital data.", 12, 104);
+  M5.Display.drawString("First boot may take ~30s (color e-ink is slow).", 12, 124);
+  M5.Display.endWrite();
   M5.Display.display();
 
-  wm.startConfigPortal("M5PaperColor-Setup");
-
-  // Portal closed (credentials saved or timeout)
-  WiFi.begin();           // reconnect with new creds
-  delay(800);             // give WiFi a moment to connect
-
-  statusMsg = "WiFi credentials saved";
-  // Bonus: automatically set location from public IP now that we have internet
-  if (WiFi.status() == WL_CONNECTED) {
-    autoLocateViaWiFi();
-  }
-  currentScreen = MAIN;
-  drawMainScreen();
-}
-
-void setup() {
-  M5.begin();
-  // Native panel is 400(w) x 600(h). Rotation 0 keeps it PORTRAIT.
-  // If your unit reads upside-down, use setRotation(2).
-  M5.Display.setRotation(0);
-
-  // On the Spectra 6 panel M5GFX picks the 6-color refresh waveform itself, so
-  // we don't force a mono fast-update mode here (those exist only on grayscale
-  // EPDs). If your M5GFX build exposes epd_mode and you want to pin quality:
-  //   M5.Display.setEpdMode(m5gfx::epd_quality);
-  M5.Display.fillScreen(COL_BG);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(COL_FG);
-
-  // Long-press threshold so BtnB.wasHold() fires for "Back".
-  M5.BtnB.setHoldThresh(HOLD_MS);
-
-  if (!LittleFS.begin()) {
-    LittleFS.format();  // Attempt to recover corrupted or unformatted LittleFS
-    if (!LittleFS.begin()) {
-      // LittleFS mount failed; downloads will still work but no offline cache
-      statusMsg = "LittleFS mount failed";
-    }
-  }
+  // LittleFS is OPTIONAL - it only provides an offline cache of the bulletin, so
+  // the app runs fine without it (it just re-downloads each time). A single
+  // format-on-fail mount handles a blank partition. If there is no LittleFS
+  // partition in the selected flash layout at all, this returns false and the
+  // "no media"/mount warnings from the FS layer are harmless - caching is simply
+  // disabled. Pick a partition scheme that includes SPIFFS/LittleFS to enable it.
+  fsAvailable = LittleFS.begin(true);   // formatOnFail = true
 
   loadConfig();
+  if (syncSystemClockFromRtc()) statusMsg = "Time from RTC";
 
-  // Seed the system clock from the battery-backed RTC so time is valid before we
-  // run any orbital math, even with no network yet. NTP (below) will refine it.
-  if (syncSystemClockFromRtc()) {
-    statusMsg = "Time from RTC";
+  // Connect WiFi via stored credentials / captive portal ("PaperSatColor-Setup").
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  wm.autoConnect("PaperSatColor-Setup");
+
+  configTime(0, 0, "pool.ntp.org");
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(250);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // First run with default location? Try to auto-locate.
+    autoLocateViaWiFi();
   }
 
-  WiFi.begin();
-  configTime(0, 0, "pool.ntp.org");
-
-  updateData();
-  selIndex = 0;
-  drawMainScreen();
+  startConfigServer();
+  fetchBulletin();
+  recomputeAllPasses();
+  needsRedraw = true;
 }
 
 void loop() {
   M5.update();
-  handleButtons();
+  server.handleClient();
 
-  // Once NTP has set a valid clock, persist it to the RTC a single time so the
-  // good time survives power-off. (NTP completes asynchronously after boot.)
+  // Persist NTP-synced time to the RTC once.
   if (!rtcSyncedFromNtp && WiFi.status() == WL_CONNECTED &&
       time(nullptr) > TLE_TIME_VALID_THRESHOLD) {
     writeSystemClockToRtc();
     rtcSyncedFromNtp = true;
   }
 
-  if (currentScreen == MAIN) {
-    // Spectra 6 full refreshes are slow (~15-19s) and flash the whole panel, so
-    // we auto-refresh rarely. Button presses are handled immediately above; these
-    // are just the periodic position/pass updates on the main screen.
-    unsigned long currentInterval = (sat.satEl > 0) ? 60000UL : 300000UL;
+  time_t now = time(nullptr);
 
-    if (millis() - lastUpdate > currentInterval) {
-      updateData();
-      drawMainScreen();
-    }
+  // Event-driven recompute: when the soonest scheduled AOS/LOS has passed, a
+  // tracked pass just began or ended - recompute all cells and redraw once.
+  if (nextEventTime != 0 && now >= nextEventTime) {
+    recomputeAllPasses();
+    needsRedraw = true;
   }
-  delay(20);
+
+  // Safety net: also recompute/redraw once a day even if no event fired (e.g. a
+  // satellite with no upcoming pass, or to pick up a fresh daily bulletin).
+  static time_t lastDaily = 0;
+  if (now > TLE_TIME_VALID_THRESHOLD && (lastDaily == 0 || now - lastDaily > 86400)) {
+    lastDaily = now;
+    fetchBulletin();
+    recomputeAllPasses();
+    needsRedraw = true;
+  }
+
+  if (needsRedraw) {
+    needsRedraw = false;
+    drawDashboard();
+  }
+
+  delay(50);
 }

@@ -1,64 +1,67 @@
 # PaperSatColor
 
-A standalone amateur-radio satellite tracker for the **M5Paper Color** (ESP32-S3, 4" SPECTRA 6 color e-paper, 600×400). It shows where your selected satellite is in the sky right now, plots its current or next pass on a polar (az/el) map, and lists upcoming pass times — all on a low-power color e-ink display that stays readable with the power off.
+A four-satellite **next-pass dashboard** for the **M5Paper Color** (ESP32-S3, 4" SPECTRA 6 color e-paper, 600×400). The screen is a static 2×2 grid: each cell shows one satellite's next pass as a polar (azimuth/elevation) plot of the pass track, with the AOS/LOS times and the pass's maximum azimuth and elevation. It is built for a slow color e-ink panel — the display only redraws when a tracked pass actually begins or ends, or when you change the configuration.
 
-This is a port of the original PaperSat (built for the monochrome, touchscreen M5Paper S3) to the newer color, button-only hardware. The display is rendered in portrait orientation and the entire interface is driven by the board's three physical buttons.
+All configuration is done over Wi-Fi through a small web page the device serves; there are no on-device menus or buttons to operate.
+
+## Why a static dashboard
+
+Color SPECTRA 6 e-paper takes roughly 15–19 seconds to refresh and **cannot do partial updates** — rendering its colors requires a full-panel waveform. A live-tracking UI that redraws frequently is therefore unusable on this hardware. PaperSatColor instead treats the panel as a glanceable status board: it computes the next pass for four satellites, draws once, and then sits still until a pass event changes what should be shown.
 
 ## Features
 
-- **Live sky position** of the selected satellite, drawn on a polar plot (zenith at center, horizon at the edge), with a direction-of-travel arrow.
-- **Pass prediction** using SGP4, showing AOS → LOS times and maximum elevation for the next several passes.
-- **Color status cues** made possible by the SPECTRA 6 panel: the satellite marker and its name turn red while it is above the horizon, and the plotted pass arc is drawn in blue.
-- **Orbital data over Wi-Fi** from the AMSAT daily bulletin, rebuilt into SGP4 elements on-device, with an offline cache so the tracker keeps working without a connection.
-- **Flexible location entry**: Maidenhead grid square, raw latitude/longitude, or automatic geolocation from your public IP.
-- **Time sync** via NTP, backed by the on-board battery RTC so the clock is correct the moment the device powers on — even offline — with a manual UTC entry fallback.
+- **Four satellites at once**, in a 2×2 grid, each with its own polar plot.
+- **Next-pass polar plot** per satellite: the pass ground track in blue, a green dot where the satellite rises (AOS), a red dot where it sets (LOS), and a red marker at the highest point. North is up; the horizon is the outer circle, the zenith is the center, and a soft yellow fill marks the high-elevation (above 45°) zone.
+- **Pass details** per satellite: AOS time and rise azimuth (green), LOS time and set azimuth (red), the maximum elevation, and the pass date. A cell currently in a pass is flagged "PASS IN PROGRESS."
+- **Full six-color display** with a clean anti-aliased typeface. The text uses the GNU FreeSans font (FreeSansBold for satellite names) rather than the blocky built-in font. The SPECTRA 6 inks are used semantically: green = rise/AOS, red = set/LOS and peak, blue = ground track and headings, yellow = the good-elevation zone. The satellite name and the max-elevation figure are colored by pass quality (green = marginal, blue = good, red = excellent), so you can judge each pass at a glance.
+- **Event-driven refresh**: the panel redraws only when a tracked pass starts or ends, when you save new configuration, and once a day to pick up the latest orbital data.
+- **Wi-Fi-only configuration**: a built-in web page with four dropdowns populated from the AMSAT bulletin satellite list, plus station location fields (lat/lon, altitude, or a Maidenhead grid).
+- **Orbital data over Wi-Fi** from the AMSAT daily bulletin, rebuilt into SGP4 elements on-device, with an offline LittleFS cache so passes keep computing without a connection.
+- **RTC-backed UTC clock** (RX8130CE), so the time is correct immediately on power-up even before Wi-Fi connects.
 
 ## Hardware
 
-- **M5Paper Color ESP32S3 Dev Kit** — ESP32-S3R8, 16 MB flash, 8 MB PSRAM, 4" SPECTRA 6 color e-paper (600×400), three programmable buttons, 1250 mAh battery, Wi-Fi.
+- **M5Paper Color ESP32S3 Dev Kit** — ESP32-S3R8, 16 MB flash, 8 MB PSRAM, 4" SPECTRA 6 color e-paper (600×400), RX8130CE RTC, 1250 mAh battery, Wi-Fi.
 
-No additional wiring is required; the app uses only the built-in display, buttons, battery gauge, and Wi-Fi.
+The three physical buttons are not used. No external wiring is required.
 
 ## Display orientation
 
-The app runs in **portrait** (400 wide × 600 tall) via `setRotation(0)`. If your unit reads upside-down, change the rotation in `setup()` to `setRotation(2)`.
+The dashboard runs in **portrait** (400 wide × 600 tall) via `setRotation(0)`. If your unit reads upside-down, change it to `setRotation(2)` in `setup()`.
 
-## Controls
+## What each cell shows
 
-The board has three buttons (A, B, C). There is no touchscreen. A hint bar at the bottom of every screen always shows what A / B / C do in the current context.
+```
+            SAT NAME            <- colored by pass quality
+            (polar plot)
+             N
+           W + E                <- horizon circle, yellow 45 deg zone,
+             S                     blue track, green AOS dot, red LOS dot,
+                                   red peak marker
+  AOS hh:mm  Az nnn   (green)
+  LOS hh:mm  Az nnn   (red)
+  Max El nn          MM/DD
+```
 
-| Button | Short press | Long press (hold ~0.6 s) |
-| --- | --- | --- |
-| **A** | Move highlight up / previous | — |
-| **B** | Select the highlighted item | Back / cancel |
-| **C** | Move highlight down / next | — |
+The polar plot maps each sampled point of the pass to a radius of `(90 − elevation) / 90`, so a point at the zenith sits at the center and a point on the horizon sits on the outer circle; the angle is the azimuth measured clockwise from north. The green dot is where the satellite rises, the red dot is where it sets, and the red marker is the highest point of the pass. The text gives the rise time and azimuth, the set time and azimuth, and the maximum elevation.
 
-The currently highlighted item is drawn as a filled (inverted) block so it is easy to see on the slow-refreshing panel.
+## First-time setup
 
-### Entering text (grid square, lat/lon, time)
+1. Flash and power on. On first boot the device starts a Wi-Fi access point named **`PaperSatColor-Setup`** (this is WiFiManager's captive portal). Join it from a phone or laptop and enter your network credentials.
+2. Once the device is on your network, it shows its **IP address** in the header bar at the top of the screen.
+3. Browse to that IP address. The setup page has four dropdowns — one per grid cell — populated from the AMSAT bulletin. Pick the satellite for each slot.
+4. Set your station location: latitude/longitude and altitude, or just a Maidenhead grid square (which overrides lat/lon). If you leave the defaults, the device will try to estimate your location from your public IP on first run.
+5. Press **Save & Refresh**. The device stores your choices, fetches fresh orbital elements for the chosen satellites, recomputes their next passes, and redraws once (about 20 seconds on this panel).
 
-Because three buttons can't drive a full keyboard, text entry uses a **character wheel**:
-
-1. Press **A / C** to scroll through the available characters.
-2. Press **B** to add the highlighted character to your entry.
-3. Scroll to **`DEL`** and press **B** to erase the last character.
-4. Scroll to **`OK`** and press **B** to confirm and save.
-
-Long-pressing **B** at any time cancels and returns to the setup menu.
-
-## Screens
-
-- **Main** — satellite name, UTC clock, battery, the polar sky plot, current Az/El, the next three pass times, data status, and the action row: *Refresh*, *Sat List*, *Setup*.
-- **Sat List** — pick a satellite from the AMSAT bulletin (paged), force a fresh data download (*Update GP*), or go back.
-- **Setup** — enter a Maidenhead grid, enter latitude/longitude, open Wi-Fi configuration, auto-locate via Wi-Fi, or set the UTC time/date.
+Your configuration persists across reboots.
 
 ## How it works
 
-On boot the app connects to saved Wi-Fi, syncs time over NTP, and downloads the AMSAT daily bulletin (`daily-bulletin.json`). For the selected satellite it reconstructs standard two-line elements from the bulletin's discrete orbital-element fields and feeds them to the SGP4 propagator. The bulletin is cached to the on-board flash (LittleFS) so the tracker continues to work offline using the last known elements. Your location, selected satellite, and cached elements are persisted in non-volatile storage and survive reboots.
+On boot the device connects to Wi-Fi, seeds its clock from the RTC, syncs time over NTP, and downloads the AMSAT daily bulletin (`daily-bulletin.json`). It reconstructs standard two-line elements for the four chosen satellites from the bulletin's discrete orbital-element fields, then runs the SGP4 propagator to find each satellite's next pass — capturing AOS, LOS, the peak elevation, the azimuth at peak, and a set of points along the pass for the polar plot. The bulletin is cached to on-board flash so the tracker keeps working offline using the last known elements.
 
-Time is kept in UTC and backed by the board's battery-powered real-time clock (RX8130CE). At startup the system clock is seeded from the RTC, so pass predictions are valid immediately even with no network. When NTP later provides a more accurate time — or when you set the time manually — that value is written back to the RTC, so the correct time persists through a full power-off and is available on the next cold boot.
+The main loop is almost idle: it services the configuration web server and watches a single scheduled time — the soonest upcoming AOS or LOS across all four cells. When that moment passes, a tracked pass has just begun or ended, so the device recomputes all four next passes and redraws once. A daily refresh also runs to pull the latest bulletin. Nothing else triggers a redraw, which keeps the slow panel quiet and the power draw low.
 
-The bulletin is refreshed roughly once a day (or on demand from *Sat List → Update GP*). On the main screen the position and pass list update about once a minute while a pass is in progress and about every five minutes otherwise — deliberately infrequent, because color e-paper takes roughly 15–19 seconds to perform its full-screen refresh and flashes while doing so. Button presses are always handled immediately.
+Time is kept in UTC, backed by the battery-powered RTC: the system clock is seeded from the RTC at startup, and once NTP provides a better time it is written back so the correct time survives a full power-off.
 
 ## Building
 
@@ -66,47 +69,48 @@ This is an Arduino sketch. The `.ino` file must live in a folder of the same nam
 
 ### Board support
 
-Install the ESP32 boards package (Espressif Systems) via the Arduino Boards Manager and select the M5Paper Color / ESP32-S3 target. Enable PSRAM in the board options; the bulletin parser allocates a large JSON document that relies on it.
+Install the ESP32 boards package (Espressif Systems) and select the M5Paper Color / ESP32-S3 target. Enable PSRAM in the board options — the bulletin parser allocates a large JSON document that relies on it.
 
 ### Libraries
 
-Install these through the Arduino Library Manager (or PlatformIO `lib_deps`):
+Install through the Arduino Library Manager (or PlatformIO `lib_deps`):
 
-- **M5Unified** and **M5GFX** — board, display, and button support.
-- **WiFiManager** (tzapu) — captive-portal Wi-Fi setup.
+- **M5Unified** and **M5GFX** — board, display, RTC, and battery support.
+- **WiFiManager** (tzapu) — captive-portal Wi-Fi credential setup.
 - **ArduinoJson** (Benoit Blanchon) — parsing the AMSAT bulletin.
 - **Sgp4** — the SGP4 orbital propagator (Hopkins' Arduino port).
 
-`WiFi`, `HTTPClient`, `Preferences`, and `LittleFS` ship with the ESP32 core.
+`WiFi`, `WebServer`, `HTTPClient`, `Preferences`, and `LittleFS` ship with the ESP32 core.
 
 ### Flashing
 
 Connect the board over USB-C and flash from the Arduino IDE (or `pio run -t upload`). If the board does not enter download mode automatically, hold the side reset button while flashing.
 
-## First-time setup
-
-1. Flash and power on. The app starts trying to connect to any previously saved Wi-Fi.
-2. Open **Setup → WiFi Configuration**. The board starts an access point named **`PaperSatColor-Setup`**. Join it from a phone or laptop and browse to `192.168.4.1` to enter your network credentials.
-3. Once online, the app can set your location automatically (**Setup → Auto Location via WiFi**), or you can enter a Maidenhead grid or latitude/longitude manually.
-4. Open **Sat List** to choose a satellite. The default is the ISS (NORAD 25544).
-
 ## Configuration defaults
 
 | Setting | Default |
 | --- | --- |
-| Location | 38.8626, −77.0562 (Washington, DC area) |
-| Satellite | ISS (NORAD 25544) |
+| Tracked satellites | ISS, FOX-1B, AO-7, FOX-1D |
+| Location | 38.8626, -77.0562 (Washington, DC area), auto-located on first run |
 | Orbital data source | AMSAT daily bulletin |
 | Time base | UTC (NTP via `pool.ntp.org`, RTC-backed) |
 
-These can all be changed at runtime from the Setup and Sat List screens; your choices are saved automatically.
+All of these are changeable from the web page; your choices are saved automatically.
 
 ## Notes and limitations
 
-- **Color e-paper is slow.** Expect a full-screen flash of roughly 15–19 seconds on each redraw. This is normal for SPECTRA 6 panels and is why the interface avoids frequent updates.
-- **Pass times are in UTC.**
+- **Color e-paper is slow and cannot do partial refresh.** Every redraw is a full-panel flash of roughly 15–19 seconds. This is inherent to SPECTRA 6 and is the entire reason the dashboard is event-driven rather than live.
+- **No microSD card is required.** The card slot is left unprobed at startup, and the orbital-data cache uses internal flash (LittleFS). If the flash filesystem can't be mounted the device still runs — it just re-downloads the bulletin each time instead of caching it.
+- **All times are UTC.**
+- A satellite with no pass in the prediction window shows "no pass found"; a satellite whose elements could not be built shows "no orbital data" (usually resolved after the next bulletin download).
 - The battery percentage assumes a single-cell LiPo (3.4 V empty, 4.2 V full); if your board's power reading differs, the percentage may need calibration.
+- The configuration web page is served unencrypted on your local network and is not password-protected; anyone on the network can change the tracked satellites.
+
+## Troubleshooting
+
+- **"GP parse failed" or "Download failed".** The device fetches the AMSAT bulletin over HTTPS using an insecure TLS client (no certificate is bundled on-device). If the download still fails it is almost always a network issue — confirm the device has internet access and that `newark192.amsat.org` is reachable from your network. Once a successful download is cached, the dashboard keeps working from that copy.
+- **The screen shows "offline" where the IP should be.** Wi-Fi hasn't connected. Re-run the captive-portal setup by connecting to the `PaperSatColor-Setup` access point.
 
 ## Credits
 
-PaperSatColor is a hardware port of the original PaperSat project. Orbital data is courtesy of AMSAT. Satellite propagation uses the SGP4 model.
+Orbital data courtesy of AMSAT. Satellite propagation uses the SGP4 model.

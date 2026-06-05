@@ -88,15 +88,15 @@ bool ledsReady = false;
 #define ALERT_VOLUME  150     // 0-255
 
 // ---------------- Buttons ----------------
-// Three physical buttons via M5Unified (M5.BtnA/B/C). Their physical positions
-// aren't fixed across board revisions, so they're mapped here - swap if your
-// unit's layout differs.
-//   BTN_REFRESH : top button   -> manual refresh (re-fetch + recompute + redraw)
-//   BTN_PAGE_UP : up button    -> show the previous page
-//   BTN_PAGE_DN : down button  -> show the next page
-#define BTN_REFRESH  M5.BtnB
-#define BTN_PAGE_UP  M5.BtnA
-#define BTN_PAGE_DN  M5.BtnC
+// Three physical buttons via M5Unified, mapped per the board's published
+// specification (USER_KEY labels). M5Unified's BtnA/B/C correspond to the
+// silkscreen keys as noted below; swap if a future board revision differs.
+//   USER_KEY1 = M5.BtnC -> manual refresh (re-fetch + recompute + redraw)
+//   USER_KEY2 = M5.BtnB -> page up   (previous page)
+//   USER_KEY3 = M5.BtnA -> page down (next page)
+#define BTN_REFRESH  M5.BtnC   // USER_KEY1
+#define BTN_PAGE_UP  M5.BtnB   // USER_KEY2
+#define BTN_PAGE_DN  M5.BtnA   // USER_KEY3
 
 // The four alert offsets relative to AOS (LOS handled separately).
 #define ALERT_T5_SEC  (5*60)
@@ -536,73 +536,131 @@ bool fetchBulletin() {
 }
 
 // ====================== PASS PREDICTION ======================
+// --- Pass-search diagnostics: set DIAG_PASS to 1 to print pass-search
+//     internals to the serial console (115200 baud) for ISS (25544) and RS-44
+//     (44909). Left in place but disabled - flip to 1 if a satellite ever shows
+//     "no pass found" again and you want to see exactly why. ---
+#define DIAG_PASS 0
+
 void computeNextPass(int idx) {
   TrackedSat &T = tracked[idx];
   T.hasPass = false; T.arcN = 0; T.nextRoll = 0;
   for (int a = 0; a < AL_COUNT; a++) T.alerted[a] = false;  // new pass -> re-arm alerts
-  if (!T.haveTLE) return;
+
+#if DIAG_PASS
+  bool diag = (strcmp(T.norad, "25544") == 0 || strcmp(T.norad, "44909") == 0);
+  if (diag) {
+    Serial.println();
+    Serial.printf("[PASS] === %s (NORAD %s) idx=%d ===\n", T.name, T.norad, idx);
+    Serial.printf("[PASS] haveTLE=%d\n", (int)T.haveTLE);
+    Serial.printf("[PASS] site lat=%.5f lon=%.5f alt=%.1f\n", qth_lat, qth_lon, qth_alt);
+    Serial.printf("[PASS] tle1[%d]=%s\n", (int)strlen(T.tle1), T.tle1);
+    Serial.printf("[PASS] tle2[%d]=%s\n", (int)strlen(T.tle2), T.tle2);
+    time_t nd = time(nullptr);
+    Serial.printf("[PASS] now(unix)=%ld  %s", (long)nd, asctime(gmtime(&nd)));
+  }
+#endif
+
+  if (!T.haveTLE) {
+#if DIAG_PASS
+    if (diag) Serial.println("[PASS] ABORT: no TLE loaded for this satellite");
+#endif
+    return;
+  }
 
   sat.init(T.name, T.tle1, T.tle2);
   sat.site(qth_lat, qth_lon, qth_alt);
 
-  // Find the next pass. We search forward from a clean start point and take the
-  // first pass whose LOS is in the future. For satellites with long gaps between
-  // visible passes (e.g. AO-7, a high MEO-ish bird), the next pass can be many
-  // hours or even a day-plus away, so we give nextpass plenty of revolutions to
-  // search and, if needed, re-anchor the search forward in time and try again.
+  // Find the next pass using the library's own forward search. The Hopperpop
+  // nextpass() advances an internal predict-point cursor as it iterates, so the
+  // robust pattern is: set the predict point ONCE to slightly before now, then
+  // call nextpass repeatedly - each call returns the next pass after the
+  // previous one, with the cursor carried over. We take the first pass whose LOS
+  // is in the future. (Re-initialising the predict point between calls is what
+  // made earlier versions unreliable.)
   passinfo p;
   time_t nowT = time(nullptr);
+  sat.initpredpoint((unsigned long)(nowT - 1800), 0.0);   // start 30 min back, once
 
-  // Start the search slightly in the past so a currently in-progress pass is
-  // still found; completed passes are filtered by the future-LOS test below.
-  time_t startT = nowT - 1800;            // 30 min back
   bool found = false;
-
-  for (int attempt = 0; attempt < 6 && !found; attempt++) {
-    sat.initpredpoint((unsigned long)startT, 0.0);
-
-    // Up to 200 revolutions of look-ahead per attempt: ISS ~15.5/day (~13 days),
-    // AO-7 ~12.5/day (~16 days) - comfortably covers any real inter-pass gap.
-    if (!sat.nextpass(&p, 200, false, 0.0)) {
-      // No pass at all from here; jump ahead a day and retry.
-      startT += 86400;
-      continue;
+  for (int attempt = 0; attempt < 30 && !found; attempt++) {
+    bool ok = sat.nextpass(&p, 100, false, 0.0);
+#if DIAG_PASS
+    if (diag) {
+      Serial.printf("[PASS] attempt %d: nextpass()=%d", attempt, (int)ok);
+      if (ok) {
+        time_t a = jdToUnix(p.jdstart), m = jdToUnix(p.jdmax), s = jdToUnix(p.jdstop);
+        Serial.printf("  maxEl=%.2f jdstart=%.6f(%ld) jdmax=%.6f(%ld) jdstop=%.6f(%ld) dStop-now=%lds",
+                      p.maxelevation, p.jdstart, (long)a, p.jdmax, (long)m,
+                      p.jdstop, (long)s, (long)(s - nowT));
+      }
+      Serial.println();
     }
+#endif
+    if (!ok) break;   // no further pass found
     if (p.maxelevation <= 0.5 || p.jdstop <= p.jdmax) {
-      // Degenerate result; nudge the search start just past it and retry.
-      startT = jdToUnix(p.jdstop) + 120;
+#if DIAG_PASS
+      if (diag) Serial.println("[PASS]   -> skip: degenerate (low maxEl or jdstop<=jdmax)");
+#endif
       continue;
     }
-
-    time_t losTime = jdToUnix(p.jdstop);
-    if (losTime <= nowT + 5) {
-      // This pass has already ended (or ends imminently) - we want the NEXT one.
-      // Re-anchor just after it and search again.
-      startT = losTime + 120;
+    if (jdToUnix(p.jdstop) <= nowT + 5) {
+#if DIAG_PASS
+      if (diag) Serial.println("[PASS]   -> skip: pass already ended");
+#endif
       continue;
     }
-    found = true;   // p now holds the next upcoming (or in-progress) pass
+    found = true;
   }
-  if (!found) return;
+  if (!found) {
+#if DIAG_PASS
+    if (diag) Serial.println("[PASS] RESULT: no usable pass found -> 'no pass found'");
+#endif
+    return;
+  }
 
   time_t losTime  = jdToUnix(p.jdstop);
 
   {
-    // AOS comes straight from the predictor's pass start (p.jdstart) rather than
-    // walking elevation back from the peak. The walk-back was fragile for high,
-    // long-pass satellites like RS-44 (it could fail to find a clean horizon
-    // crossing within its window and wrongly report "no pass found"); jdstart is
-    // always populated for a valid pass.
-    time_t aosTime = jdToUnix(p.jdstart);
-    if (aosTime >= losTime) aosTime = losTime - 60;   // sanity guard
-
-    // Optional fine-snap: nudge AOS to the first El>=0 sample, but never discard
-    // the pass if the snap is inconclusive - jdstart stands on its own.
-    for (int d = -30; d <= 60; d += 5) {
-      sat.findsat((unsigned long)(aosTime + d));
-      if (sat.satEl >= 0.0) { aosTime = aosTime + d; break; }
+    // AOS: walk back from the peak until elevation drops to <= 0. We do NOT use
+    // the library's p.jdstart - it is unreliable for some satellites (e.g.
+    // RS-44, where it can equal the peak or LOS time). Deriving AOS from the
+    // peak is what worked across ISS, AO-7, and RS-44. The walk-back window is
+    // generous (3h) so it covers long high-elevation passes, and it is bounded
+    // by the pass's own peak so it never runs away.
+    time_t peakTime = jdToUnix(p.jdmax);
+    time_t aosTime = peakTime;
+    bool crossed = false;
+    for (long back = 30; back <= 3*3600; back += 30) {
+      time_t tt = peakTime - back;
+      sat.findsat((unsigned long)tt);
+      if (sat.satEl <= 0.0) { aosTime = tt; crossed = true; break; }
     }
-    if (losTime <= aosTime + 20) return;   // implausibly short; skip
+    if (!crossed) {
+      // Fallback: couldn't find a horizon crossing within the window. Rather
+      // than drop the pass (showing a false "no pass found"), approximate AOS
+      // from the library's pass start so the pass is still displayed.
+      aosTime = jdToUnix(p.jdstart);
+      if (aosTime >= losTime || aosTime < peakTime - 3*3600) aosTime = peakTime - 600;
+    } else {
+      // Refine forward to the first sample with El > 0 (a clean AOS instant).
+      for (int d = 0; d < 120; d++) {
+        sat.findsat((unsigned long)(aosTime + d));
+        if (sat.satEl > 0.0) { aosTime += d; break; }
+      }
+    }
+#if DIAG_PASS
+    if (diag) {
+      Serial.printf("[PASS] walk-back crossed=%d  AOS=%ld  LOS=%ld  dur=%lds\n",
+                    (int)crossed, (long)aosTime, (long)losTime, (long)(losTime - aosTime));
+    }
+#endif
+    if (losTime <= aosTime + 20) {
+#if DIAG_PASS
+      if (diag) Serial.println("[PASS] REJECT: pass too short (los <= aos+20) -> no pass shown");
+#endif
+      return;   // implausibly short; skip
+    }
 
     // Azimuth where the satellite rises (AOS) and sets (LOS).
     sat.findsat((unsigned long)aosTime);
@@ -622,6 +680,12 @@ void computeNextPass(int idx) {
     T.nextRoll = losTime + 35;   // roll this sat forward ~35s after its pass ends
     T.maxEl = p.maxelevation; T.aosAz = azAtAos; T.losAz = azAtLos;
     T.hasPass = true;
+#if DIAG_PASS
+    if (diag) {
+      Serial.printf("[PASS] SUCCESS: hasPass=1 maxEl=%.1f aosAz=%.0f losAz=%.0f arcN=%d\n",
+                    T.maxEl, T.aosAz, T.losAz, T.arcN);
+    }
+#endif
   }
 }
 
@@ -1113,6 +1177,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_spk = true;             // enable the built-in speaker for alert tones
   M5.begin(cfg);                       // M5Unified does NOT probe SD by default
+  Serial.begin(115200);                // diagnostics console (115200 baud)
   M5.Display.setRotation(0);          // portrait 400x600 (use 2 if upside down)
   M5.Display.setAutoDisplay(false);   // EPD: accumulate drawing, push once via display()
   M5.Display.setTextDatum(top_left);  // drawString y = top of glyph (matches layout math)

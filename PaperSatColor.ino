@@ -94,8 +94,8 @@ bool ledsReady = false;
 //   BTN_REFRESH : top button   -> manual refresh (re-fetch + recompute + redraw)
 //   BTN_PAGE_UP : up button    -> show the previous page
 //   BTN_PAGE_DN : down button  -> show the next page
-#define BTN_REFRESH  M5.BtnA
-#define BTN_PAGE_UP  M5.BtnB
+#define BTN_REFRESH  M5.BtnB
+#define BTN_PAGE_UP  M5.BtnA
 #define BTN_PAGE_DN  M5.BtnC
 
 // The four alert offsets relative to AOS (LOS handled separately).

@@ -144,6 +144,7 @@ bool   fetchBulletin();
 bool   parseGPJson(const String& payload, bool buildTrackedTLEs);
 void   recomputeAllPasses();
 void   checkAlerts();
+void   updateLedPhase();
 void   fireAlert(AlertKind k, const char* satName);
 void   computeNextPass(int idx);
 bool   autoLocateViaWiFi();
@@ -551,29 +552,36 @@ void computeNextPass(int idx) {
 void recomputeAllPasses() {
   for (int i = 0; i < NUM_TRACKED; i++) computeNextPass(i);
   time_t now = time(nullptr);
-  // Schedule the next screen recompute for the soonest pass END (LOS) in the
-  // future. We deliberately key the redraw off LOS, not AOS: at AOS the shown
-  // pass is the one in progress and should stay on screen; only once it ends do
-  // we roll every cell forward to its next pass. (The T-5/T-1/AOS moments are
-  // handled by checkAlerts(), independently of the redraw schedule.) A small
-  // margin past LOS avoids re-finding the same pass.
+  // Schedule the next screen recompute for shortly after the soonest pass ENDS.
+  // We key the redraw off LOS, not AOS: while a pass is in progress its cell
+  // should stay on screen; only once the pass concludes do we roll every cell
+  // forward to its next pass and redraw. The +35s margin lets the post-LOS red
+  // LED window (LOS .. LOS+30s) finish before the pass data is rolled forward,
+  // and avoids re-finding the same pass. (T-5/T-1/AOS tones and the steady LED
+  // phase are handled separately and don't depend on this schedule.)
   nextEventTime = 0;
   for (int i = 0; i < NUM_TRACKED; i++) {
     if (!tracked[i].hasPass) continue;
-    time_t evt = tracked[i].los + 5;
+    time_t evt = tracked[i].los + 35;
     if (evt > now && (nextEventTime == 0 || evt < nextEventTime)) nextEventTime = evt;
   }
 }
 
 // ====================== ALERTS (LED + SOUND) ======================
-// Each alert is a short, distinct LED color + tone pattern so you can tell which
-// of the four moments fired without looking at the screen:
-//   T-5 min : amber,  two low beeps
-//   T-1 min : orange, three mid beeps
-//   AOS     : green,  rising two-tone (it's up!)
-//   LOS     : red,    falling two-tone (it's gone)
-// The LED flash and tones are brief and non-blocking-ish (tone() runs in the
-// background; we use short delays only for the multi-blink/beep cadence).
+// Two independent behaviors:
+//  1) The RGB LEDs hold a STEADY color reflecting the current phase of the
+//     nearest pass, so a glance tells you where things stand:
+//        T-5 .. T-1 min : amber   (pass coming up)
+//        T-1 min .. AOS : orange  (imminent)
+//        AOS .. LOS     : green   (pass in progress - go!)
+//        LOS .. LOS+30s : red     (just ended)
+//        otherwise      : off
+//     With four satellites, the LED shows the most urgent phase across all of
+//     them (in progress > imminent > upcoming > just-ended).
+//  2) A short distinct TONE plays once at each boundary (T-5, T-1, AOS, LOS) as
+//     an audible cue at the moment the phase changes.
+
+static CRGB curLedColor = CRGB::Black;
 
 static void ledFill(const CRGB& c) {
   if (!ledsReady) return;
@@ -581,53 +589,67 @@ static void ledFill(const CRGB& c) {
   FastLED.show();
 }
 
-static void beep(float freq, uint32_t ms) {
-  M5.Speaker.tone(freq, ms);
-  // tone() is asynchronous; wait out its duration so sequential beeps are distinct.
-  uint32_t t0 = millis();
-  while (M5.Speaker.isPlaying() && millis() - t0 < ms + 50) { delay(5); }
+// Set the steady LED color only when it changes (avoids redundant SPI writes).
+static void ledSet(const CRGB& c) {
+  if (c.r == curLedColor.r && c.g == curLedColor.g && c.b == curLedColor.b) return;
+  curLedColor = c;
+  ledFill(c);
 }
 
-// Flash the LEDs `blinks` times in color `c`, each on for `onMs`.
-static void ledBlink(const CRGB& c, int blinks, int onMs) {
-  if (!ledsReady) return;
-  for (int b = 0; b < blinks; b++) {
-    ledFill(c);
-    delay(onMs);
-    ledFill(CRGB::Black);
-    if (b < blinks - 1) delay(onMs / 2);
-  }
-}
-
-// Fire one alert: distinct color + tone signature per kind. LED and sound run
-// together (LED blink provides the inter-beep gaps).
+// One-shot tone signature per boundary (distinct so you can tell them apart).
 void fireAlert(AlertKind k, const char* satName) {
   M5.Speaker.setVolume(ALERT_VOLUME);
   switch (k) {
-    case AL_T5:   // 5 minutes out: amber, two low beeps
-      M5.Speaker.tone(660, 180); ledBlink(CRGB(255, 120, 0), 1, 180);
-      M5.Speaker.tone(660, 180); ledBlink(CRGB(255, 120, 0), 1, 180);
+    case AL_T5:                                   // 5 min out: two low beeps
+      M5.Speaker.tone(660, 180); delay(230);
+      M5.Speaker.tone(660, 180); delay(200);
       break;
-    case AL_T1:   // 1 minute out: orange, three mid beeps
-      for (int i = 0; i < 3; i++) { M5.Speaker.tone(880, 150); ledBlink(CRGB(255, 70, 0), 1, 150); }
+    case AL_T1:                                   // 1 min out: three mid beeps
+      for (int i = 0; i < 3; i++) { M5.Speaker.tone(880, 150); delay(200); }
       break;
-    case AL_AOS:  // rise: green, rising two-tone
-      M5.Speaker.tone(880, 200);  ledBlink(CRGB::Green, 1, 200);
-      M5.Speaker.tone(1320, 350); ledBlink(CRGB::Green, 1, 350);
+    case AL_AOS:                                  // rise: rising two-tone
+      M5.Speaker.tone(880, 200);  delay(230);
+      M5.Speaker.tone(1320, 350); delay(380);
       break;
-    case AL_LOS:  // set: red, falling two-tone
-      M5.Speaker.tone(1320, 200); ledBlink(CRGB::Red, 1, 200);
-      M5.Speaker.tone(660, 350);  ledBlink(CRGB::Red, 1, 350);
+    case AL_LOS:                                  // set: falling two-tone
+      M5.Speaker.tone(1320, 200); delay(230);
+      M5.Speaker.tone(660, 350);  delay(380);
       break;
     default: break;
   }
-  ledFill(CRGB::Black);
 }
 
-// Poll all tracked passes and fire any alert whose moment has arrived (once
-// each). Called every loop. Uses a small look-back window so a brief scheduling
-// delay (e.g. during a slow EPD refresh) still fires the alert rather than
-// skipping it. Alerts more than 30s late are treated as missed and skipped.
+// Drive the steady LED color from the most urgent pass phase across all sats.
+// Priority: in-progress (green) > imminent (orange) > upcoming (amber) >
+// just-ended (red) > off. Returns nothing; updates the LEDs directly.
+void updateLedPhase() {
+  time_t now = time(nullptr);
+  if (now < TLE_TIME_VALID_THRESHOLD) { ledSet(CRGB::Black); return; }
+
+  // Rank the phases; pick the highest-priority active one.
+  enum { PH_NONE=0, PH_POST=1, PH_T5=2, PH_T1=3, PH_PASS=4 };
+  int best = PH_NONE;
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    TrackedSat &T = tracked[i];
+    if (!T.hasPass) continue;
+    int ph = PH_NONE;
+    if (now >= T.aos && now <= T.los)                       ph = PH_PASS;
+    else if (now >= T.aos - ALERT_T1_SEC && now < T.aos)    ph = PH_T1;
+    else if (now >= T.aos - ALERT_T5_SEC && now < T.aos)    ph = PH_T5;
+    else if (now > T.los && now <= T.los + 30)              ph = PH_POST;
+    if (ph > best) best = ph;
+  }
+  switch (best) {
+    case PH_PASS: ledSet(CRGB::Green);          break;  // in progress
+    case PH_T1:   ledSet(CRGB(255, 70, 0));     break;  // orange, imminent
+    case PH_T5:   ledSet(CRGB(255, 120, 0));    break;  // amber, upcoming
+    case PH_POST: ledSet(CRGB::Red);            break;  // just ended (<=30s)
+    default:      ledSet(CRGB::Black);          break;  // off
+  }
+}
+
+// Fire the one-shot boundary tones. Each boundary chimes once per pass. A 30s
+// window absorbs scheduling delay (e.g. a slow EPD refresh); >30s late = missed.
 void checkAlerts() {
   time_t now = time(nullptr);
   if (now < TLE_TIME_VALID_THRESHOLD) return;   // clock not set yet
@@ -710,14 +732,15 @@ void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
     return;
   }
 
-  // --- Polar plot, centered, sized to leave room for the 3-line text block ---
-  // Reserve space: name (PAD+nameH+Nlabel), plot (2r), S label, gap, text, PAD.
-  int textBlockH = 3 * LINE_H + 4;
+  // --- Polar plot, centered, sized to leave room for the text block ---
+  const int TEXT_LH = 20;                    // roomier line height for the text block
+  const int SLABEL  = 16;                    // height taken by the "S" label below the plot
   int topUsed = PAD + nameH + 18;            // down to where the plot circle's top sits (incl. N label)
-  int avail   = cellH - topUsed - 14 /*S label*/ - 6 /*gap*/ - textBlockH - PAD;
-  int r = avail / 2;
-  if (r > 58) r = 58;                        // cap so plots aren't huge
-  if (r < 34) r = 34;                        // floor so they're still readable
+  int r = 58;                                // fixed, comfortable plot radius
+  // If a very short cell ever can't fit it, shrink gracefully.
+  int maxR = (cellH - topUsed - SLABEL - (3 * TEXT_LH) - PAD - 12) / 2;
+  if (r > maxR) r = maxR;
+  if (r < 34) r = 34;
   int cx = originX + cellW / 2;
   int cy = originY + topUsed + r;
 
@@ -737,7 +760,14 @@ void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
   M5.Display.drawString("E", cx + r + 4, cy - 8);
   M5.Display.drawString("W", cx - r - 14, cy - 8);
 
-  int textY = cy + r + 18;           // below the S label (S glyph spans cy+r+1 .. +17)
+  // Vertically center the 3-line text block in the leftover space below the plot
+  // (there is extra room at the bottom of each cell, so balance it rather than
+  // crowding the text right under the plot).
+  int blockTop  = cy + r + SLABEL;                  // first free y below the S label
+  int blockH    = 3 * TEXT_LH;
+  int remaining = (originY + cellH - PAD) - blockTop - blockH;
+  int gap       = remaining > 12 ? remaining / 2 : 6;
+  int textY     = blockTop + gap;
 
   // Helper to map an az/el sample to a screen point on the polar plot.
   auto polar = [&](float azDeg, float elDeg, int &ox, int &oy) {
@@ -779,31 +809,33 @@ void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
   time_t now = time(nullptr);
   bool nowUp = (T.aos <= now && now <= T.los);
 
-  // "in progress" badge replaces the date area on the AOS line if active.
+  // AOS line (green): rise time + rise azimuth.
   M5.Display.setTextColor(COL_AOS);
-  sprintf(line, "AOS %02d:%02d Az%.0f", a.tm_hour, a.tm_min, T.aosAz);
+  sprintf(line, "AOS %02d:%02d  Az %.0f", a.tm_hour, a.tm_min, T.aosAz);
   M5.Display.drawString(line, innerX, textY);
   drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY);
 
+  // LOS line (red): set time + set azimuth.
   M5.Display.setTextColor(COL_LOS);
-  sprintf(line, "LOS %02d:%02d Az%.0f", l.tm_hour, l.tm_min, T.losAz);
-  M5.Display.drawString(line, innerX, textY + LINE_H);
-  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY + LINE_H);
+  sprintf(line, "LOS %02d:%02d  Az %.0f", l.tm_hour, l.tm_min, T.losAz);
+  M5.Display.drawString(line, innerX, textY + TEXT_LH);
+  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY + TEXT_LH);
 
+  // Max elevation (colored by quality).
   M5.Display.setTextColor(quality);
   sprintf(line, "Max El %.0f", T.maxEl);
-  M5.Display.drawString(line, innerX, textY + 2 * LINE_H);
-  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY + 2 * LINE_H);
+  M5.Display.drawString(line, innerX, textY + 2 * TEXT_LH);
+  drawDegreeSymbol(innerX + M5.Display.textWidth(line), textY + 2 * TEXT_LH);
 
   // Right side of the Max-El line: date, or "NOW" badge if a pass is happening.
   if (nowUp) {
     M5.Display.setTextColor(COL_NOW);
     const char* nb = "NOW";
-    M5.Display.drawString(nb, originX + cellW - PAD - M5.Display.textWidth(nb), textY + 2 * LINE_H);
+    M5.Display.drawString(nb, originX + cellW - PAD - M5.Display.textWidth(nb), textY + 2 * TEXT_LH);
   } else {
     M5.Display.setTextColor(COL_GRID);
     sprintf(line, "%02d/%02d", a.tm_mon + 1, a.tm_mday);
-    M5.Display.drawString(line, originX + cellW - PAD - M5.Display.textWidth(line), textY + 2 * LINE_H);
+    M5.Display.drawString(line, originX + cellW - PAD - M5.Display.textWidth(line), textY + 2 * TEXT_LH);
   }
   M5.Display.setTextColor(COL_FG);
 }
@@ -814,20 +846,17 @@ void drawDashboard() {
   M5.Display.fillScreen(COL_BG);
 
   // ----- Header bar -----  (TOP_MARGIN keeps text off the bezel)
+  // No clock: the panel refreshes far too infrequently (only after a pass ends)
+  // for a time display to ever be accurate, so it's omitted. The header shows
+  // where to configure (the device IP) and the battery level.
   const int TOP_MARGIN = 6;
   M5.Display.setFont(FONT_BODY);
-  struct tm ti; bool haveTime = getLocalTime(&ti);
-  char hdr[48];
-  if (haveTime) sprintf(hdr, "%02d:%02d UTC", ti.tm_hour, ti.tm_min);
-  else strcpy(hdr, "--:-- UTC");
-  M5.Display.setTextColor(COL_FG);
-  M5.Display.drawString(hdr, 8, TOP_MARGIN);
 
-  // IP address (blue) centered.
-  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("offline");
-  int ipw = M5.Display.textWidth(ip.c_str());
+  String ipLabel = (WiFi.status() == WL_CONNECTED)
+                     ? (String("Setup: ") + WiFi.localIP().toString())
+                     : String("WiFi: offline");
   M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? COL_HDR : COL_LOS);
-  M5.Display.drawString(ip.c_str(), SCR_W/2 - ipw/2, TOP_MARGIN);
+  M5.Display.drawString(ipLabel.c_str(), 8, TOP_MARGIN);
 
   // Battery.
   int batPct = getBatteryPercent();
@@ -1076,6 +1105,7 @@ void loop() {
   // below, which would otherwise roll a just-started pass forward and clear its
   // alert flags before the AOS/LOS alert could fire.
   checkAlerts();
+  updateLedPhase();   // hold the steady phase color (amber/orange/green/red/off)
 
   // Event-driven recompute: when the soonest scheduled AOS/LOS has passed, a
   // tracked pass just began or ended - recompute all cells and redraw once.

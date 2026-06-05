@@ -585,23 +585,24 @@ void computeNextPass(int idx) {
   }
   if (!found) return;
 
-  time_t peakTime = jdToUnix(p.jdmax);
   time_t losTime  = jdToUnix(p.jdstop);
 
   {
-    time_t aosTime = peakTime; bool crossed = false;
-    for (long back = 0; back < 2*3600; back += 30) {
-      time_t tt = peakTime - back;
-      if (tt < nowT - 3600) break;
-      sat.findsat((unsigned long)tt);
-      if (sat.satEl <= 0.0) { aosTime = tt; crossed = true; break; }
-    }
-    if (!crossed) return;
-    for (int d = 0; d < 120; d++) {
+    // AOS comes straight from the predictor's pass start (p.jdstart) rather than
+    // walking elevation back from the peak. The walk-back was fragile for high,
+    // long-pass satellites like RS-44 (it could fail to find a clean horizon
+    // crossing within its window and wrongly report "no pass found"); jdstart is
+    // always populated for a valid pass.
+    time_t aosTime = jdToUnix(p.jdstart);
+    if (aosTime >= losTime) aosTime = losTime - 60;   // sanity guard
+
+    // Optional fine-snap: nudge AOS to the first El>=0 sample, but never discard
+    // the pass if the snap is inconclusive - jdstart stands on its own.
+    for (int d = -30; d <= 60; d += 5) {
       sat.findsat((unsigned long)(aosTime + d));
-      if (sat.satEl > 0.0) { aosTime += d; break; }
+      if (sat.satEl >= 0.0) { aosTime = aosTime + d; break; }
     }
-    if (losTime <= aosTime + 30) return;
+    if (losTime <= aosTime + 20) return;   // implausibly short; skip
 
     // Azimuth where the satellite rises (AOS) and sets (LOS).
     sat.findsat((unsigned long)aosTime);

@@ -431,6 +431,22 @@ bool parseGPJson(const String& payload, bool buildTrackedTLEs) {
   return satCount > 0;
 }
 
+// Format the persistent data-status line: "GP data: MMM DD HH:MM" from the last
+// successful update, or a short state if we've never gotten data.
+static void setGpStatusFromCache() {
+  if (lastTLETime > TLE_TIME_VALID_THRESHOLD) {
+    struct tm t = *gmtime(&lastTLETime);
+    static const char* mon[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    char buf[40];
+    snprintf(buf, sizeof(buf), "GP data: %s %02d %02d:%02d UTC",
+             mon[t.tm_mon], t.tm_mday, t.tm_hour, t.tm_min);
+    statusMsg = String(buf);
+  } else if (lastTLETime != 0) {
+    statusMsg = "GP data loaded";          // have data but no valid timestamp yet
+  }
+  // else: leave whatever boot/error message is set
+}
+
 bool fetchBulletin() {
   bool haveLocal = fsAvailable && LittleFS.exists("/daily-bulletin.json");
   time_t now = time(nullptr);
@@ -458,14 +474,16 @@ bool fetchBulletin() {
     int code = http.GET();
     if (code == 200) {
       String payload = http.getString(); http.end();
-      if (fsAvailable) {
-        File f = LittleFS.open("/daily-bulletin.json", "w");
-        if (f) { f.print(payload); f.close(); }
-      }
-      lastTLETime = timeValid ? now : 1;
-      if (timeValid) { prefs.begin("satdash", false); prefs.putULong("lastTLE",(unsigned long)lastTLETime); prefs.end(); }
       if (payload.length() > 100 && parseGPJson(payload, true)) {
-        statusMsg = "GP data updated"; return true;
+        if (fsAvailable) {
+          File f = LittleFS.open("/daily-bulletin.json", "w");
+          if (f) { f.print(payload); f.close(); }
+        }
+        lastTLETime = timeValid ? now : 1;
+        if (timeValid) { prefs.begin("satdash", false); prefs.putULong("lastTLE",(unsigned long)lastTLETime); prefs.end(); }
+        setGpStatusFromCache();
+        if (lastTLETime <= TLE_TIME_VALID_THRESHOLD) statusMsg = "GP data updated";
+        return true;
       }
       statusMsg = "GP parse failed (" + String((int)payload.length()) + " bytes)";
       // fall through to try a cached copy
@@ -481,15 +499,23 @@ bool fetchBulletin() {
     if (f) {
       String payload = f.readString(); f.close();
       if (payload.length() > 100 && parseGPJson(payload, true)) {
-        statusMsg = needDownload ? "Using cached GP data" : "GP data loaded";
+        setGpStatusFromCache();
+        if (lastTLETime <= TLE_TIME_VALID_THRESHOLD) statusMsg = "GP data loaded";
         return true;
       }
     }
   }
 
-  if (WiFi.status() != WL_CONNECTED && !haveLocal) statusMsg = "No WiFi yet, no cached data";
-  else if (!needDownload && !haveLocal)            statusMsg = "Waiting for first download";
-  // keep whatever more-specific error was set above otherwise
+  // Nothing parsed this call. Be honest only when we truly have no data; if we
+  // previously had a successful update (lastTLETime set) keep showing that, so a
+  // transient download miss doesn't replace a valid "GP data: <date>" line.
+  if (lastTLETime > TLE_TIME_VALID_THRESHOLD) {
+    setGpStatusFromCache();
+  } else if (WiFi.status() != WL_CONNECTED && !haveLocal) {
+    statusMsg = "No WiFi yet, no cached data";
+  } else if (!haveLocal) {
+    statusMsg = "Waiting for first download";
+  }
   return false;
 }
 
@@ -504,6 +530,11 @@ void computeNextPass(int idx) {
   sat.site(qth_lat, qth_lon, qth_alt);
 
   passinfo p;
+  // Begin the search a bit BEFORE now so a pass currently in progress is still
+  // found (its peak may be moments away, and the AOS walk-back below recovers
+  // its real start). Completed passes are filtered out by the LOS check below.
+  // Using "now" (not a future offset) avoids skipping an in-progress pass when a
+  // recompute is triggered mid-pass (e.g. by a config save or daily refresh).
   sat.initpredpoint((unsigned long)time(nullptr), 0.0);
 
   int guard = 0;
@@ -513,6 +544,16 @@ void computeNextPass(int idx) {
 
     time_t peakTime = jdToUnix(p.jdmax);
     time_t losTime  = jdToUnix(p.jdstop);
+
+    // Skip any pass that has already ended (or ends within the next few
+    // seconds); we want the next UPCOMING or currently in-progress pass, never
+    // the one that just completed. This is what makes the post-LOS redraw roll
+    // forward to the next pass instead of re-showing the finished one.
+    if (losTime <= time(nullptr) + 5) {
+      // advance the search window past this pass and look again
+      sat.initpredpoint((unsigned long)(losTime + 120), 0.0);
+      continue;
+    }
 
     time_t aosTime = peakTime; bool crossed = false;
     for (long back = 0; back < 2*3600; back += 30) {
@@ -846,19 +887,28 @@ void drawDashboard() {
   M5.Display.fillScreen(COL_BG);
 
   // ----- Header bar -----  (TOP_MARGIN keeps text off the bezel)
-  // No clock: the panel refreshes far too infrequently (only after a pass ends)
-  // for a time display to ever be accurate, so it's omitted. The header shows
-  // where to configure (the device IP) and the battery level.
+  // Left to right: app name, "Config:" + device IP (where to configure over
+  // WiFi), and battery level at the right. No clock - the panel refreshes far
+  // too infrequently for a time display to stay accurate.
   const int TOP_MARGIN = 6;
+  int hx = 8;
+
+  // App name (bold, accent color).
+  M5.Display.setFont(FONT_NAME);
+  M5.Display.setTextColor(COL_HDR);
+  M5.Display.drawString("PaperSatColor", hx, TOP_MARGIN);
+  hx += M5.Display.textWidth("PaperSatColor") + 12;
+
+  // "Config:" label + IP address (or offline state).
   M5.Display.setFont(FONT_BODY);
-
-  String ipLabel = (WiFi.status() == WL_CONNECTED)
-                     ? (String("Setup: ") + WiFi.localIP().toString())
-                     : String("WiFi: offline");
+  M5.Display.setTextColor(COL_FG);
+  M5.Display.drawString("Config:", hx, TOP_MARGIN);
+  hx += M5.Display.textWidth("Config:") + 6;
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("offline");
   M5.Display.setTextColor(WiFi.status() == WL_CONNECTED ? COL_HDR : COL_LOS);
-  M5.Display.drawString(ipLabel.c_str(), 8, TOP_MARGIN);
+  M5.Display.drawString(ip.c_str(), hx, TOP_MARGIN);
 
-  // Battery.
+  // Battery (right-aligned), colored by level.
   int batPct = getBatteryPercent();
   char bat[8]; sprintf(bat, "%d%%", batPct);
   int bw = M5.Display.textWidth(bat);

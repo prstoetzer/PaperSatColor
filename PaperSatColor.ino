@@ -66,7 +66,9 @@ double qth_lat = 38.8626;
 double qth_lon = -77.0562;
 double qth_alt = 10.0;
 
-#define NUM_TRACKED 4     // 2x2 grid
+#define PER_PAGE    4     // 2x2 grid per page
+#define NUM_PAGES   2     // two pages
+#define NUM_TRACKED (PER_PAGE * NUM_PAGES)   // 8 satellites total
 #define ARC_POINTS  24    // polar arc samples per pass
 
 // ---------------- Alerts (LED + sound) ----------------
@@ -84,6 +86,17 @@ bool ledsReady = false;
 
 // Sound uses the built-in speaker (ES8311 codec + AW8737A amp) via M5.Speaker.
 #define ALERT_VOLUME  150     // 0-255
+
+// ---------------- Buttons ----------------
+// Three physical buttons via M5Unified (M5.BtnA/B/C). Their physical positions
+// aren't fixed across board revisions, so they're mapped here - swap if your
+// unit's layout differs.
+//   BTN_REFRESH : top button   -> manual refresh (re-fetch + recompute + redraw)
+//   BTN_PAGE_UP : up button    -> show the previous page
+//   BTN_PAGE_DN : down button  -> show the next page
+#define BTN_REFRESH  M5.BtnA
+#define BTN_PAGE_UP  M5.BtnB
+#define BTN_PAGE_DN  M5.BtnC
 
 // The four alert offsets relative to AOS (LOS handled separately).
 #define ALERT_T5_SEC  (5*60)
@@ -118,17 +131,20 @@ struct TrackedSat {
   float  arcAz[ARC_POINTS];
   float  arcEl[ARC_POINTS];
   bool   alerted[AL_COUNT];   // which alerts have fired for the current pass
+  time_t nextRoll;            // when to roll this sat forward to its next pass (los+margin)
 };
 TrackedSat tracked[NUM_TRACKED];
 
-const char* DEFAULT_NORAD[NUM_TRACKED] = { "25544", "43017", "27607", "22825" };
-const char* DEFAULT_NAME[NUM_TRACKED]  = { "ISS",   "AO-91", "SO-50", "AO-27" };
+const char* DEFAULT_NORAD[NUM_TRACKED] = { "25544", "44909", "7530",  "27607",
+                                           "43017", "22825", "24278", "43678" };
+const char* DEFAULT_NAME[NUM_TRACKED]  = { "ISS",   "RS-44", "AO-07", "SO-50",
+                                           "AO-91", "AO-27", "FO-29", "PO-101" };
 
 time_t lastTLETime = 0;
 bool   forceTLEUpdate = false;
 String statusMsg = "Booting...";
 
-time_t nextEventTime = 0;   // soonest future AOS/LOS across all cells
+int    currentPage = 0;     // which page (of NUM_PAGES) is on screen
 bool   needsRedraw = true;  // request a single redraw on next loop
 
 bool rtcSyncedFromNtp = false;
@@ -522,52 +538,70 @@ bool fetchBulletin() {
 // ====================== PASS PREDICTION ======================
 void computeNextPass(int idx) {
   TrackedSat &T = tracked[idx];
-  T.hasPass = false; T.arcN = 0;
+  T.hasPass = false; T.arcN = 0; T.nextRoll = 0;
   for (int a = 0; a < AL_COUNT; a++) T.alerted[a] = false;  // new pass -> re-arm alerts
   if (!T.haveTLE) return;
 
   sat.init(T.name, T.tle1, T.tle2);
   sat.site(qth_lat, qth_lon, qth_alt);
 
+  // Find the next pass. We search forward from a clean start point and take the
+  // first pass whose LOS is in the future. For satellites with long gaps between
+  // visible passes (e.g. AO-7, a high MEO-ish bird), the next pass can be many
+  // hours or even a day-plus away, so we give nextpass plenty of revolutions to
+  // search and, if needed, re-anchor the search forward in time and try again.
   passinfo p;
-  // Begin the search a bit BEFORE now so a pass currently in progress is still
-  // found (its peak may be moments away, and the AOS walk-back below recovers
-  // its real start). Completed passes are filtered out by the LOS check below.
-  // Using "now" (not a future offset) avoids skipping an in-progress pass when a
-  // recompute is triggered mid-pass (e.g. by a config save or daily refresh).
-  sat.initpredpoint((unsigned long)time(nullptr), 0.0);
+  time_t nowT = time(nullptr);
 
-  int guard = 0;
-  while (guard++ < 12) {
-    if (!sat.nextpass(&p, 40, false, 0.0)) return;
-    if (p.maxelevation <= 0.5 || p.jdstop <= p.jdmax) continue;
+  // Start the search slightly in the past so a currently in-progress pass is
+  // still found; completed passes are filtered by the future-LOS test below.
+  time_t startT = nowT - 1800;            // 30 min back
+  bool found = false;
 
-    time_t peakTime = jdToUnix(p.jdmax);
-    time_t losTime  = jdToUnix(p.jdstop);
+  for (int attempt = 0; attempt < 6 && !found; attempt++) {
+    sat.initpredpoint((unsigned long)startT, 0.0);
 
-    // Skip any pass that has already ended (or ends within the next few
-    // seconds); we want the next UPCOMING or currently in-progress pass, never
-    // the one that just completed. This is what makes the post-LOS redraw roll
-    // forward to the next pass instead of re-showing the finished one.
-    if (losTime <= time(nullptr) + 5) {
-      // advance the search window past this pass and look again
-      sat.initpredpoint((unsigned long)(losTime + 120), 0.0);
+    // Up to 200 revolutions of look-ahead per attempt: ISS ~15.5/day (~13 days),
+    // AO-7 ~12.5/day (~16 days) - comfortably covers any real inter-pass gap.
+    if (!sat.nextpass(&p, 200, false, 0.0)) {
+      // No pass at all from here; jump ahead a day and retry.
+      startT += 86400;
+      continue;
+    }
+    if (p.maxelevation <= 0.5 || p.jdstop <= p.jdmax) {
+      // Degenerate result; nudge the search start just past it and retry.
+      startT = jdToUnix(p.jdstop) + 120;
       continue;
     }
 
+    time_t losTime = jdToUnix(p.jdstop);
+    if (losTime <= nowT + 5) {
+      // This pass has already ended (or ends imminently) - we want the NEXT one.
+      // Re-anchor just after it and search again.
+      startT = losTime + 120;
+      continue;
+    }
+    found = true;   // p now holds the next upcoming (or in-progress) pass
+  }
+  if (!found) return;
+
+  time_t peakTime = jdToUnix(p.jdmax);
+  time_t losTime  = jdToUnix(p.jdstop);
+
+  {
     time_t aosTime = peakTime; bool crossed = false;
     for (long back = 0; back < 2*3600; back += 30) {
       time_t tt = peakTime - back;
-      if (tt < time(nullptr) - 3600) break;
+      if (tt < nowT - 3600) break;
       sat.findsat((unsigned long)tt);
       if (sat.satEl <= 0.0) { aosTime = tt; crossed = true; break; }
     }
-    if (!crossed) continue;
+    if (!crossed) return;
     for (int d = 0; d < 120; d++) {
       sat.findsat((unsigned long)(aosTime + d));
       if (sat.satEl > 0.0) { aosTime += d; break; }
     }
-    if (losTime <= aosTime + 30) continue;
+    if (losTime <= aosTime + 30) return;
 
     // Azimuth where the satellite rises (AOS) and sets (LOS).
     sat.findsat((unsigned long)aosTime);
@@ -584,28 +618,18 @@ void computeNextPass(int idx) {
     }
     T.arcN = n;
     T.aos = aosTime; T.los = losTime;
+    T.nextRoll = losTime + 35;   // roll this sat forward ~35s after its pass ends
     T.maxEl = p.maxelevation; T.aosAz = azAtAos; T.losAz = azAtLos;
     T.hasPass = true;
-    return;
   }
 }
 
 void recomputeAllPasses() {
+  // Recompute the next pass for every tracked satellite (all NUM_TRACKED, across
+  // both pages, so alerts and LED phases work for off-page satellites too). Each
+  // satellite gets its own nextRoll time (los+margin); the loop watches those
+  // individually and only redraws when a satellite on the CURRENT page rolls.
   for (int i = 0; i < NUM_TRACKED; i++) computeNextPass(i);
-  time_t now = time(nullptr);
-  // Schedule the next screen recompute for shortly after the soonest pass ENDS.
-  // We key the redraw off LOS, not AOS: while a pass is in progress its cell
-  // should stay on screen; only once the pass concludes do we roll every cell
-  // forward to its next pass and redraw. The +35s margin lets the post-LOS red
-  // LED window (LOS .. LOS+30s) finish before the pass data is rolled forward,
-  // and avoids re-finding the same pass. (T-5/T-1/AOS tones and the steady LED
-  // phase are handled separately and don't depend on this schedule.)
-  nextEventTime = 0;
-  for (int i = 0; i < NUM_TRACKED; i++) {
-    if (!tracked[i].hasPass) continue;
-    time_t evt = tracked[i].los + 35;
-    if (evt > now && (nextEventTime == 0 || evt < nextEventTime)) nextEventTime = evt;
-  }
 }
 
 // ====================== ALERTS (LED + SOUND) ======================
@@ -927,9 +951,11 @@ void drawDashboard() {
   int cellW = SCR_W / 2;
   int cellH = gridH / 2;
 
-  for (int i = 0; i < NUM_TRACKED; i++) {
-    int col = i % 2;
-    int row = i / 2;
+  // Draw the four cells of the current page. Satellite index = page*PER_PAGE + slot.
+  for (int slot = 0; slot < PER_PAGE; slot++) {
+    int i = currentPage * PER_PAGE + slot;
+    int col = slot % 2;
+    int row = slot / 2;
     int ox = col * cellW;
     int oy = gridTop + row * cellH;
     drawCell(i, ox, oy, cellW, cellH);
@@ -952,9 +978,15 @@ void drawDashboard() {
   M5.Display.fillCircle(58, fy + 7, 3, COL_LOS);
   M5.Display.drawString("set", 66, fy);
 
+  // Page indicator (e.g. "Pg 1/2"), in the header accent color.
+  char pg[12]; snprintf(pg, sizeof(pg), "Pg %d/%d", currentPage + 1, NUM_PAGES);
+  M5.Display.setTextColor(COL_HDR);
+  M5.Display.drawString(pg, 100, fy);
+  int pageEnd = 100 + M5.Display.textWidth(pg);
+
   // Status message: right-aligned region, truncated with an ellipsis so it can
-  // never run past the screen edge or collide with the legend.
-  int statusX = 100;                       // legend ends ~94px
+  // never run past the screen edge or collide with the legend/page indicator.
+  int statusX = pageEnd + 10;
   int statusMaxW = SCR_W - 8 - statusX;     // available width to the right margin
   String st = statusMsg;
   // Trim characters until it fits the available width.
@@ -991,7 +1023,9 @@ void handleRoot() {
   html += "<form method=POST action=/save>";
 
   for (int i = 0; i < NUM_TRACKED; i++) {
-    html += "<label>Slot " + String(i + 1) + "</label><select name=n" + String(i) + ">";
+    int pg = i / PER_PAGE + 1, slot = i % PER_PAGE + 1;
+    html += "<label>Page " + String(pg) + " &middot; Slot " + String(slot) +
+            "</label><select name=n" + String(i) + ">";
     // current selection first (in case it isn't in the catalog list)
     bool found = false;
     for (int j = 0; j < satCount; j++) {
@@ -1151,17 +1185,40 @@ void loop() {
 
   time_t now = time(nullptr);
 
-  // Fire any due LED/sound alerts FIRST - before the event-driven recompute
-  // below, which would otherwise roll a just-started pass forward and clear its
-  // alert flags before the AOS/LOS alert could fire.
-  checkAlerts();
-  updateLedPhase();   // hold the steady phase color (amber/orange/green/red/off)
-
-  // Event-driven recompute: when the soonest scheduled AOS/LOS has passed, a
-  // tracked pass just began or ended - recompute all cells and redraw once.
-  if (nextEventTime != 0 && now >= nextEventTime) {
+  // ----- Buttons -----
+  // Top button: manual refresh (re-fetch bulletin, recompute all, redraw).
+  if (BTN_REFRESH.wasPressed()) {
+    statusMsg = "Refreshing...";
+    forceTLEUpdate = true;
+    fetchBulletin();
     recomputeAllPasses();
     needsRedraw = true;
+  }
+  // Up / Down: change page. With two pages these both just toggle, but the
+  // semantics are preserved (up -> previous, down -> next, clamped/wrapped).
+  if (BTN_PAGE_UP.wasPressed()) {
+    currentPage = (currentPage + NUM_PAGES - 1) % NUM_PAGES;
+    needsRedraw = true;
+  }
+  if (BTN_PAGE_DN.wasPressed()) {
+    currentPage = (currentPage + 1) % NUM_PAGES;
+    needsRedraw = true;
+  }
+
+  // Fire LED/sound alerts for ALL tracked satellites (both pages) FIRST, before
+  // any roll-forward below clears a just-started pass's alert flags.
+  checkAlerts();
+  updateLedPhase();   // steady phase color across all 8 satellites
+
+  // Per-satellite roll-forward: when a satellite's pass has ended (now past its
+  // nextRoll = los+margin), recompute just that satellite's next pass. Only
+  // request a screen redraw if that satellite is on the CURRENTLY DISPLAYED page
+  // - a pass ending on the other page updates silently (no wasteful refresh).
+  for (int i = 0; i < NUM_TRACKED; i++) {
+    if (tracked[i].hasPass && tracked[i].nextRoll != 0 && now >= tracked[i].nextRoll) {
+      computeNextPass(i);
+      if (i / PER_PAGE == currentPage) needsRedraw = true;
+    }
   }
 
   // Safety net: also recompute/redraw once a day even if no event fired (e.g. a

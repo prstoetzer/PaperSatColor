@@ -1,20 +1,28 @@
 // ============================================================================
-// PaperSatColor  -  4-satellite next-pass dashboard for M5Paper Color
+// PaperSatColor  -  up-to-20-satellite next-pass dashboard for M5Paper Color
 // ----------------------------------------------------------------------------
 // Hardware: M5Paper Color ESP32-S3 Dev Kit (4" SPECTRA 6 color e-paper, 400x600
-// portrait, RX8130CE RTC, Wi-Fi, three buttons - buttons are NOT used here).
+// portrait, RX8130CE RTC, Wi-Fi, three USER_KEY buttons, two RGB LEDs, speaker).
 //
-// Concept: a STATIC dashboard. The screen is a 2x2 grid; each cell shows ONE
-// satellite's next pass as a polar (azimuth/elevation) plot of the pass ground
-// track, plus AOS/LOS times and the pass maximum azimuth and elevation. Because
+// Concept: a STATIC dashboard. Up to 20 satellites are tracked across up to 5
+// pages of 4, each page a 2x2 grid; each cell shows ONE satellite's next pass as
+// a polar (azimuth/elevation) plot of the pass ground track, plus AOS/LOS times
+// and the pass maximum azimuth and elevation. Slots may be left blank (the spot
+// is left empty) and a page with no satellites is hidden entirely, so the number
+// of pages shown matches how many satellites are actually configured. Because
 // the Spectra 6 panel takes ~15-19s to refresh and cannot do partial updates,
-// the display is drawn only when something actually changes: a tracked pass
-// begins or ends (a "pass event"), or the configuration is changed.
+// the display is drawn only when something actually changes: a tracked pass on
+// the current page begins or ends (a "pass event"), the page is switched, a
+// manual refresh is pressed, or the configuration is changed.
+//
+// Buttons (mapped per the board's published USER_KEY spec): USER_KEY1 = manual
+// refresh; USER_KEY2/USER_KEY3 = page up/down through the occupied pages.
 //
 // Configuration is done SOLELY over Wi-Fi: the device serves a web page (its IP
-// is shown on screen) with four dropdowns - populated from the AMSAT bulletin
-// satellite list - to choose the four tracked satellites, plus optional station
-// location fields. There are no on-device menus.
+// is shown on screen) with up to 20 dropdowns - populated from the AMSAT
+// bulletin satellite list, each with a (blank) option so no slot is forced - to
+// choose the tracked satellites, plus optional station location fields. There
+// are no on-device configuration menus.
 // ============================================================================
 
 #include <M5Unified.h>
@@ -67,8 +75,8 @@ double qth_lon = -77.0562;
 double qth_alt = 10.0;
 
 #define PER_PAGE    4     // 2x2 grid per page
-#define NUM_PAGES   2     // two pages
-#define NUM_TRACKED (PER_PAGE * NUM_PAGES)   // 8 satellites total
+#define NUM_PAGES   5     // up to five pages
+#define NUM_TRACKED (PER_PAGE * NUM_PAGES)   // up to 20 satellites total
 #define ARC_POINTS  24    // polar arc samples per pass
 
 // ---------------- Alerts (LED + sound) ----------------
@@ -135,10 +143,22 @@ struct TrackedSat {
 };
 TrackedSat tracked[NUM_TRACKED];
 
-const char* DEFAULT_NORAD[NUM_TRACKED] = { "25544", "44909", "7530",  "27607",
-                                           "43017", "22825", "24278", "43678" };
-const char* DEFAULT_NAME[NUM_TRACKED]  = { "ISS",   "RS-44", "AO-07", "SO-50",
-                                           "AO-91", "AO-27", "FO-29", "PO-101" };
+// Default tracked set. Only the first eight slots are pre-filled (pages 1-2);
+// the remaining twelve slots (pages 3-5) start blank. Empty string = blank slot.
+// Defaults apply only to a fresh/cleared device; the web config can fill or
+// blank any slot afterward.
+const char* DEFAULT_NORAD[NUM_TRACKED] = {
+  "25544", "44909", "7530",  "27607",
+  "43017", "22825", "24278", "43678",
+  "", "", "", "",
+  "", "", "", "",
+  "", "", "", "" };
+const char* DEFAULT_NAME[NUM_TRACKED]  = {
+  "ISS",   "RS-44", "AO-07", "SO-50",
+  "AO-91", "AO-27", "FO-29", "PO-101",
+  "", "", "", "",
+  "", "", "", "",
+  "", "", "", "" };
 
 time_t lastTLETime = 0;
 bool   forceTLEUpdate = false;
@@ -171,6 +191,41 @@ void   handleRoot();
 void   handleSave();
 void   gridToLatLon(const char* mgrid, double &lat, double &lon);
 void   latLonToGrid(double lat, double lon, char* gridOut);
+
+// ====================== SLOT / PAGE HELPERS ======================
+// A slot is "blank" when it has no NORAD id assigned. Blank slots are never
+// drawn and are skipped by pass computation. A page is "occupied" if any of its
+// four slots is non-blank; blank pages are never rendered and are skipped when
+// paging.
+inline bool slotEmpty(int idx) {
+  return idx < 0 || idx >= NUM_TRACKED || tracked[idx].norad[0] == '\0';
+}
+inline bool pageOccupied(int page) {
+  if (page < 0 || page >= NUM_PAGES) return false;
+  for (int s = 0; s < PER_PAGE; s++) if (!slotEmpty(page * PER_PAGE + s)) return true;
+  return false;
+}
+int occupiedPageCount() {
+  int n = 0;
+  for (int p = 0; p < NUM_PAGES; p++) if (pageOccupied(p)) n++;
+  return n;
+}
+// Step from the current page to the next/prev occupied page, wrapping around.
+// dir = +1 (next) or -1 (prev). Returns the same page if none other qualifies.
+int adjacentOccupiedPage(int from, int dir) {
+  for (int step = 1; step <= NUM_PAGES; step++) {
+    int cand = ((from + dir * step) % NUM_PAGES + NUM_PAGES) % NUM_PAGES;
+    if (pageOccupied(cand)) return cand;
+  }
+  return from;
+}
+// Ordinal (1-based) of a page among the occupied pages, for the "Pg x/y" label.
+int occupiedPageOrdinal(int page) {
+  int n = 0;
+  for (int p = 0; p <= page && p < NUM_PAGES; p++) if (pageOccupied(p)) n++;
+  return n;
+}
+
 
 // ====================== TIME HELPERS ======================
 time_t jdToUnix(double jd) { return (time_t)((jd - 2440587.5) * 86400.0); }
@@ -406,6 +461,7 @@ bool parseGPJson(const String& payload, bool buildTrackedTLEs) {
     if (buildTrackedTLEs) {
       long thisNorad = atol(noradStr.c_str());
       for (int i = 0; i < NUM_TRACKED; i++) {
+        if (slotEmpty(i)) continue;     // don't try to match blank slots
         // Compare numerically so "07530" (config) matches 7530 (JSON number).
         if (atol(tracked[i].norad) == thisNorad && thisNorad != 0) {
           char t1[80], t2[80];
@@ -546,6 +602,8 @@ void computeNextPass(int idx) {
   TrackedSat &T = tracked[idx];
   T.hasPass = false; T.arcN = 0; T.nextRoll = 0;
   for (int a = 0; a < AL_COUNT; a++) T.alerted[a] = false;  // new pass -> re-arm alerts
+
+  if (slotEmpty(idx)) return;   // blank slot: nothing to compute
 
 #if DIAG_PASS
   bool diag = (strcmp(T.norad, "25544") == 0 || strcmp(T.norad, "44909") == 0);
@@ -690,10 +748,11 @@ void computeNextPass(int idx) {
 }
 
 void recomputeAllPasses() {
-  // Recompute the next pass for every tracked satellite (all NUM_TRACKED, across
-  // both pages, so alerts and LED phases work for off-page satellites too). Each
-  // satellite gets its own nextRoll time (los+margin); the loop watches those
-  // individually and only redraws when a satellite on the CURRENT page rolls.
+  // Recompute the next pass for every tracked satellite (all NUM_TRACKED slots,
+  // across every page, so alerts and LED phases work for off-page satellites
+  // too; blank slots return immediately). Each satellite gets its own nextRoll
+  // time (los+margin); the loop watches those individually and only redraws when
+  // a satellite on the CURRENT page rolls.
   for (int i = 0; i < NUM_TRACKED; i++) computeNextPass(i);
 }
 
@@ -706,8 +765,8 @@ void recomputeAllPasses() {
 //        AOS .. LOS     : green   (pass in progress - go!)
 //        LOS .. LOS+30s : red     (just ended)
 //        otherwise      : off
-//     With four satellites, the LED shows the most urgent phase across all of
-//     them (in progress > imminent > upcoming > just-ended).
+//     Across all configured satellites, the LED shows the most urgent phase
+//     among them (in progress > imminent > upcoming > just-ended).
 //  2) A short distinct TONE plays once at each boundary (T-5, T-1, AOS, LOS) as
 //     an audible cue at the moment the phase changes.
 
@@ -824,6 +883,7 @@ void drawDegreeSymbol(int16_t x, int16_t y) {
 // Layout is built top-down from a cursor with explicit padding so nothing
 // overlaps and there is breathing room on every side.
 void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
+  if (slotEmpty(idx)) return;        // blank slot: leave the spot empty
   TrackedSat &T = tracked[idx];
 
   const int PAD = 9;                 // interior padding from the cell edges
@@ -971,6 +1031,13 @@ void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
 }
 
 void drawDashboard() {
+  // Never render a blank page: if the current page has no satellites (e.g. after
+  // a config change emptied it), snap to the nearest occupied page. If every
+  // page is blank, fall through and draw an empty grid with a clear hint.
+  if (!pageOccupied(currentPage) && occupiedPageCount() > 0) {
+    currentPage = adjacentOccupiedPage(currentPage, +1);
+  }
+
   M5.Display.waitDisplay();
   M5.Display.startWrite();
   M5.Display.fillScreen(COL_BG);
@@ -1017,6 +1084,7 @@ void drawDashboard() {
   int cellH = gridH / 2;
 
   // Draw the four cells of the current page. Satellite index = page*PER_PAGE + slot.
+  // Blank slots render nothing (drawCell no-ops), leaving the spot empty.
   for (int slot = 0; slot < PER_PAGE; slot++) {
     int i = currentPage * PER_PAGE + slot;
     int col = slot % 2;
@@ -1025,9 +1093,22 @@ void drawDashboard() {
     int oy = gridTop + row * cellH;
     drawCell(i, ox, oy, cellW, cellH);
   }
-  // grid dividers (inset from the edges so they don't touch the bezel)
-  M5.Display.drawFastVLine(cellW, gridTop + 4, gridH - 8, COL_GRID);
-  M5.Display.drawFastHLine(8, gridTop + cellH, SCR_W - 16, COL_GRID);
+
+  if (occupiedPageCount() == 0) {
+    // No satellites configured at all - guide the user to the web config rather
+    // than showing an empty grid with no explanation.
+    M5.Display.setFont(FONT_BODY);
+    M5.Display.setTextColor(COL_LOS);
+    const char* m1 = "No satellites configured";
+    const char* m2 = "Open Config: in a browser to add some";
+    M5.Display.drawString(m1, SCR_W/2 - M5.Display.textWidth(m1)/2, gridTop + gridH/2 - 16);
+    M5.Display.drawString(m2, SCR_W/2 - M5.Display.textWidth(m2)/2, gridTop + gridH/2 + 6);
+    M5.Display.setTextColor(COL_FG);
+  } else {
+    // grid dividers (inset from the edges so they don't touch the bezel)
+    M5.Display.drawFastVLine(cellW, gridTop + 4, gridH - 8, COL_GRID);
+    M5.Display.drawFastHLine(8, gridTop + cellH, SCR_W - 16, COL_GRID);
+  }
 
   // ----- Footer: compact legend on the left, status on the right (clipped) -----
   int footTop = SCR_H - footerH;
@@ -1043,8 +1124,9 @@ void drawDashboard() {
   M5.Display.fillCircle(58, fy + 7, 3, COL_LOS);
   M5.Display.drawString("set", 66, fy);
 
-  // Page indicator (e.g. "Pg 1/2"), in the header accent color.
-  char pg[12]; snprintf(pg, sizeof(pg), "Pg %d/%d", currentPage + 1, NUM_PAGES);
+  // Page indicator (e.g. "Pg 1/3"), counting only occupied (rendered) pages.
+  char pg[12];
+  snprintf(pg, sizeof(pg), "Pg %d/%d", occupiedPageOrdinal(currentPage), occupiedPageCount());
   M5.Display.setTextColor(COL_HDR);
   M5.Display.drawString(pg, 100, fy);
   int pageEnd = 100 + M5.Display.textWidth(pg);
@@ -1070,37 +1152,50 @@ void drawDashboard() {
 }
 
 // ====================== CONFIG WEB SERVER ======================
-// Serves a page with four <select> dropdowns (populated from the AMSAT catalog)
-// and station location fields. Saving persists config, refetches/recomputes, and
-// requests one redraw. All configuration happens here - there is no on-device UI.
+// Serves a page with up to NUM_TRACKED <select> dropdowns (populated from the
+// AMSAT catalog, grouped by page, each with a (blank) option) and station
+// location fields. Saving persists config, refetches/recomputes, and requests
+// one redraw. All configuration happens here - there is no on-device UI.
 void handleRoot() {
   String html;
-  html.reserve(8000);
+  html.reserve(20000);
   html += "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
   html += "<title>PaperSatColor Setup</title><style>";
   html += "body{font-family:sans-serif;margin:16px;max-width:640px}";
-  html += "h1{font-size:1.3em}label{display:block;margin:10px 0 3px;font-weight:bold}";
+  html += "h1{font-size:1.3em}h2{font-size:1.05em;margin:18px 0 2px;border-bottom:1px solid #ccc}";
+  html += "label{display:block;margin:8px 0 3px;font-weight:bold}";
   html += "select,input{width:100%;padding:6px;font-size:1em}";
   html += "button{margin-top:16px;padding:10px 18px;font-size:1em}";
   html += ".row{display:flex;gap:10px}.row>div{flex:1}</style></head><body>";
-  html += "<h1>PaperSatColor</h1><p>Choose four satellites to track. Catalog: ";
-  html += String(satCount) + " satellites from the AMSAT bulletin.</p>";
+  html += "<h1>PaperSatColor</h1><p>Assign up to " + String(NUM_TRACKED) +
+          " satellites across " + String(NUM_PAGES) + " pages of " + String(PER_PAGE) +
+          ". Leave any slot on <b>(blank)</b> to skip it - a page with no "
+          "satellites is hidden entirely. Catalog: " + String(satCount) +
+          " satellites from the AMSAT bulletin.</p>";
   html += "<form method=POST action=/save>";
 
   for (int i = 0; i < NUM_TRACKED; i++) {
-    int pg = i / PER_PAGE + 1, slot = i % PER_PAGE + 1;
-    html += "<label>Page " + String(pg) + " &middot; Slot " + String(slot) +
-            "</label><select name=n" + String(i) + ">";
-    // current selection first (in case it isn't in the catalog list)
+    int slot = i % PER_PAGE + 1;
+    if (i % PER_PAGE == 0) {
+      html += "<h2>Page " + String(i / PER_PAGE + 1) + "</h2>";
+    }
+    html += "<label>Slot " + String(slot) + "</label><select name=n" + String(i) + ">";
+    // Blank option - selected when this slot is currently empty. This is what
+    // lets the user leave a slot (and therefore a page) unused.
+    html += "<option value=''";
+    if (slotEmpty(i)) html += " selected";
+    html += ">&mdash; (blank) &mdash;</option>";
+    // Catalog options.
     bool found = false;
     for (int j = 0; j < satCount; j++) {
-      bool sel = (strcmp(satList[j].norad, tracked[i].norad) == 0);
+      bool sel = (!slotEmpty(i) && strcmp(satList[j].norad, tracked[i].norad) == 0);
       if (sel) found = true;
       html += "<option value='" + String(satList[j].norad) + "'";
       if (sel) html += " selected";
       html += ">" + String(satList[j].name) + " (" + String(satList[j].norad) + ")</option>";
     }
-    if (!found) {
+    // Current selection not in the catalog (e.g. catalog not loaded yet): keep it.
+    if (!found && !slotEmpty(i)) {
       html += "<option value='" + String(tracked[i].norad) + "' selected>" +
               String(tracked[i].name) + " (" + String(tracked[i].norad) + ")</option>";
     }
@@ -1128,6 +1223,18 @@ void handleSave() {
     String arg = "n" + String(i);
     if (server.hasArg(arg)) {
       String norad = server.arg(arg);
+      norad.trim();
+      if (norad.length() == 0) {
+        // Blank slot: clear everything so it is treated as empty everywhere.
+        tracked[i].norad[0] = '\0';
+        tracked[i].name[0]  = '\0';
+        tracked[i].tle1[0]  = '\0';
+        tracked[i].tle2[0]  = '\0';
+        tracked[i].haveTLE  = false;
+        tracked[i].hasPass  = false;
+        tracked[i].nextRoll = 0;
+        continue;
+      }
       norad.toCharArray(tracked[i].norad, sizeof(tracked[i].norad));
       // resolve display name from catalog
       for (int j = 0; j < satCount; j++) {
@@ -1252,7 +1359,7 @@ void loop() {
   time_t now = time(nullptr);
 
   // ----- Buttons -----
-  // Top button: manual refresh (re-fetch bulletin, recompute all, redraw).
+  // USER_KEY1: manual refresh (re-fetch bulletin, recompute all, redraw).
   if (BTN_REFRESH.wasPressed()) {
     statusMsg = "Refreshing...";
     forceTLEUpdate = true;
@@ -1260,21 +1367,22 @@ void loop() {
     recomputeAllPasses();
     needsRedraw = true;
   }
-  // Up / Down: change page. With two pages these both just toggle, but the
-  // semantics are preserved (up -> previous, down -> next, clamped/wrapped).
+  // Up / Down: move to the previous / next OCCUPIED page, wrapping around and
+  // skipping any blank pages entirely. With only one occupied page these are
+  // no-ops; with none, there is nothing to page to.
   if (BTN_PAGE_UP.wasPressed()) {
-    currentPage = (currentPage + NUM_PAGES - 1) % NUM_PAGES;
-    needsRedraw = true;
+    int np = adjacentOccupiedPage(currentPage, -1);
+    if (np != currentPage) { currentPage = np; needsRedraw = true; }
   }
   if (BTN_PAGE_DN.wasPressed()) {
-    currentPage = (currentPage + 1) % NUM_PAGES;
-    needsRedraw = true;
+    int np = adjacentOccupiedPage(currentPage, +1);
+    if (np != currentPage) { currentPage = np; needsRedraw = true; }
   }
 
-  // Fire LED/sound alerts for ALL tracked satellites (both pages) FIRST, before
+  // Fire LED/sound alerts for ALL tracked satellites (every page) FIRST, before
   // any roll-forward below clears a just-started pass's alert flags.
   checkAlerts();
-  updateLedPhase();   // steady phase color across all 8 satellites
+  updateLedPhase();   // steady phase color across all configured satellites
 
   // Per-satellite roll-forward: when a satellite's pass has ended (now past its
   // nextRoll = los+margin), recompute just that satellite's next pass. Only

@@ -899,13 +899,31 @@ void drawCell(int idx, int originX, int originY, int cellW, int cellH) {
     else                      quality = COL_LOW;
   }
 
-  // --- Name (bold), top of cell ---
+  // --- Name (bold), top of cell. Truncate with an ellipsis if it's too wide
+  //     for the cell so a long catalog name never overruns into the next cell. ---
   int nameH = 18;
   M5.Display.setFont(FONT_NAME);
   M5.Display.setTextColor(T.hasPass ? quality : COL_FG);
-  int tw = M5.Display.textWidth(T.name);
-  if (tw > innerW) tw = innerW;      // (centering still fine if it's wide)
-  M5.Display.drawString(T.name, originX + cellW/2 - M5.Display.textWidth(T.name)/2, originY + PAD);
+
+  char nameBuf[sizeof(T.name) + 2];
+  strncpy(nameBuf, T.name, sizeof(nameBuf));
+  nameBuf[sizeof(nameBuf) - 1] = '\0';
+  if (M5.Display.textWidth(nameBuf) > innerW) {
+    // Drop trailing characters and append "..." until it fits the inner width.
+    int len = strlen(nameBuf);
+    while (len > 0) {
+      nameBuf[len] = '\0';
+      char trial[sizeof(nameBuf) + 3];
+      snprintf(trial, sizeof(trial), "%s...", nameBuf);
+      if (M5.Display.textWidth(trial) <= innerW) {
+        strncpy(nameBuf, trial, sizeof(nameBuf));
+        nameBuf[sizeof(nameBuf) - 1] = '\0';
+        break;
+      }
+      len--;
+    }
+  }
+  M5.Display.drawString(nameBuf, originX + cellW/2 - M5.Display.textWidth(nameBuf)/2, originY + PAD);
   M5.Display.setTextColor(COL_FG);
   M5.Display.setFont(FONT_BODY);
 

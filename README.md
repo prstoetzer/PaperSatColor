@@ -34,8 +34,8 @@ The three physical buttons control refresh and paging (see below); no external w
 All three buttons are mapped per the board's published USER_KEY specification:
 
 - **USER_KEY1** — manual refresh: re-fetch the AMSAT bulletin, recompute all passes, and redraw. **Hold it for ~1 second** to instead save a screenshot of the current screen to the microSD card (see below).
-- **USER_KEY2** — page up: show the previous occupied page.
-- **USER_KEY3** — page down: show the next occupied page.
+- **USER_KEY3** — page up: show the previous occupied page.
+- **USER_KEY2** — page down: show the next occupied page.
 
 A short press and a long press of USER_KEY1 are distinguished by an 800 ms hold threshold, so a normal tap refreshes and only a deliberate hold triggers a screenshot.
 

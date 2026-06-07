@@ -122,11 +122,11 @@ bool ledsReady = false;
 // specification (USER_KEY labels). M5Unified's BtnA/B/C correspond to the
 // silkscreen keys as noted below; swap if a future board revision differs.
 //   USER_KEY1 = M5.BtnC -> manual refresh (re-fetch + recompute + redraw)
-//   USER_KEY2 = M5.BtnB -> page up   (previous page)
-//   USER_KEY3 = M5.BtnA -> page down (next page)
+//   USER_KEY3 = M5.BtnA -> page up   (previous page)
+//   USER_KEY2 = M5.BtnB -> page down (next page)
 #define BTN_REFRESH  M5.BtnC   // USER_KEY1
-#define BTN_PAGE_UP  M5.BtnB   // USER_KEY2
-#define BTN_PAGE_DN  M5.BtnA   // USER_KEY3
+#define BTN_PAGE_UP  M5.BtnA   // USER_KEY3
+#define BTN_PAGE_DN  M5.BtnB   // USER_KEY2
 
 // The four alert offsets relative to AOS (LOS handled separately).
 #define ALERT_T5_SEC  (5*60)

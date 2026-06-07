@@ -26,6 +26,8 @@
 // ============================================================================
 
 #include <M5Unified.h>
+#include <SPI.h>
+#include <SD.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
@@ -43,6 +45,16 @@
 // ====================== DISPLAY ======================
 #define SCR_W 400
 #define SCR_H 600
+
+// ---------------- microSD (for screenshots) ----------------
+// SPI pins per the M5PaperS3 published specification. VERIFY against your unit's
+// pinout if the card isn't detected. The card is initialised lazily on the first
+// screenshot, so a missing card costs nothing during normal operation.
+#define SD_SPI_CS_PIN   47
+#define SD_SPI_SCK_PIN  39
+#define SD_SPI_MOSI_PIN 38
+#define SD_SPI_MISO_PIN 40
+bool sdReady = false;   // true once SD.begin() has succeeded at least once
 
 // Spectra 6 gives us six inks: black, white, red, yellow, blue, green. We use
 // each one with a consistent meaning so the dashboard reads at a glance:
@@ -197,6 +209,7 @@ void   handleRoot();
 void   handleSave();
 void   gridToLatLon(const char* mgrid, double &lat, double &lon);
 void   latLonToGrid(double lat, double lon, char* gridOut);
+bool   saveScreenshot();
 
 // ====================== SLOT / PAGE HELPERS ======================
 // A slot is "blank" when it has no NORAD id assigned. Blank slots are never
@@ -1328,6 +1341,80 @@ void startConfigServer() {
   server.begin();
 }
 
+// ====================== SCREENSHOT ======================
+// Capture the current framebuffer and write it to the microSD card as a 24-bit
+// uncompressed BMP under /screenshots. The SD card is initialised lazily here
+// (it is not touched during normal operation), so a missing card only costs a
+// failed attempt. Returns true on success. Files are named by capture order so
+// they don't collide: /screenshots/shotNNNN.bmp.
+//
+// BMP layout: 14-byte file header + 40-byte DIBv3 header, pixels stored
+// bottom-up as B,G,R with each row padded to a 4-byte boundary.
+bool saveScreenshot() {
+  // Lazily bring up the SPI bus + card. Re-begin is harmless if already up.
+  if (!sdReady) {
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+    sdReady = SD.begin(SD_SPI_CS_PIN, SPI, 25000000);
+    if (!sdReady) return false;          // no card / wrong pins
+  }
+  if (!SD.exists("/screenshots")) SD.mkdir("/screenshots");
+
+  // Pick the next free filename so successive shots don't overwrite each other.
+  char path[40];
+  int idx = 0;
+  do {
+    snprintf(path, sizeof(path), "/screenshots/shot%04d.bmp", idx++);
+  } while (SD.exists(path) && idx < 10000);
+
+  File f = SD.open(path, FILE_WRITE, true);
+  if (!f) return false;
+
+  const int W = M5.Display.width();
+  const int H = M5.Display.height();
+  const int rowBytes = (W * 3 + 3) & ~3;       // padded to 4-byte boundary
+  const uint32_t dataSize = (uint32_t)rowBytes * H;
+  const uint32_t fileSize = 54 + dataSize;
+
+  // ---- BMP file header (14 bytes) ----
+  uint8_t fh[14] = {0};
+  fh[0] = 'B'; fh[1] = 'M';
+  fh[2] = fileSize; fh[3] = fileSize >> 8; fh[4] = fileSize >> 16; fh[5] = fileSize >> 24;
+  fh[10] = 54;                                  // pixel data offset
+  f.write(fh, 14);
+
+  // ---- DIB header (BITMAPINFOHEADER, 40 bytes) ----
+  uint8_t ih[40] = {0};
+  ih[0] = 40;
+  ih[4]  = W;  ih[5]  = W >> 8;  ih[6]  = W >> 16;  ih[7]  = W >> 24;
+  ih[8]  = H;  ih[9]  = H >> 8;  ih[10] = H >> 16;  ih[11] = H >> 24;
+  ih[12] = 1;                                   // planes
+  ih[14] = 24;                                  // bits per pixel
+  ih[20] = dataSize; ih[21] = dataSize >> 8; ih[22] = dataSize >> 16; ih[23] = dataSize >> 24;
+  f.write(ih, 40);
+
+  // ---- Pixel rows, bottom-up ----
+  // Read one display row at a time into an RGB888 buffer, repack as BGR with
+  // padding. readRect with an rgb888 buffer gives 3 bytes/pixel as R,G,B.
+  uint8_t *rgb = (uint8_t*)malloc(W * 3);
+  uint8_t *row = (uint8_t*)malloc(rowBytes);
+  if (!rgb || !row) { if (rgb) free(rgb); if (row) free(row); f.close(); return false; }
+  memset(row, 0, rowBytes);
+
+  bool ok = true;
+  for (int y = H - 1; y >= 0; y--) {            // BMP is bottom-up
+    M5.Display.readRect(0, y, W, 1, (lgfx::rgb888_t*)rgb);
+    for (int x = 0; x < W; x++) {
+      uint8_t r = rgb[x*3 + 0], g = rgb[x*3 + 1], b = rgb[x*3 + 2];
+      row[x*3 + 0] = b; row[x*3 + 1] = g; row[x*3 + 2] = r;   // BGR
+    }
+    if (f.write(row, rowBytes) != (size_t)rowBytes) { ok = false; break; }
+  }
+
+  free(rgb); free(row);
+  f.close();
+  return ok;
+}
+
 // ====================== SETUP / LOOP ======================
 void setup() {
   auto cfg = M5.config();
@@ -1349,6 +1436,10 @@ void setup() {
 
   // Speaker volume for alert tones.
   M5.Speaker.setVolume(ALERT_VOLUME);
+
+  // USER_KEY1 long-press threshold (ms) for the screenshot gesture. A press
+  // shorter than this is treated as a normal refresh click.
+  BTN_REFRESH.setHoldThresh(800);
 
   // Boot splash (single refresh).
   M5.Display.startWrite();
@@ -1408,8 +1499,15 @@ void loop() {
   time_t now = time(nullptr);
 
   // ----- Buttons -----
-  // USER_KEY1: manual refresh (re-fetch bulletin, recompute all, redraw).
-  if (BTN_REFRESH.wasPressed()) {
+  // USER_KEY1: a short press refreshes (re-fetch bulletin, recompute, redraw);
+  // a long press (>= hold threshold) saves a screenshot of the current screen to
+  // the microSD card instead. wasHold() fires once when the hold threshold is
+  // crossed; wasClicked() fires on release only if it was NOT a hold, so the two
+  // never both trigger for one press.
+  if (BTN_REFRESH.wasHold()) {
+    statusMsg = saveScreenshot() ? "Screenshot saved" : "Screenshot failed (no SD?)";
+    needsRedraw = true;
+  } else if (BTN_REFRESH.wasClicked()) {
     statusMsg = "Refreshing...";
     forceTLEUpdate = true;
     fetchBulletin();

@@ -11,7 +11,8 @@ Color SPECTRA 6 e-paper takes roughly 15–19 seconds to refresh and **cannot do
 ## Features
 
 - **Up to 20 satellites across up to 5 pages**, four per page in a 2×2 grid, each with its own polar plot. Blank slots are left empty and fully blank pages are skipped, so the number of pages matches how many satellites you actually configure. Press the up/down buttons to move between the occupied pages.
-- **Physical buttons** (mapped per the board's published USER_KEY spec): **USER_KEY1** triggers a manual refresh (re-fetch the bulletin, recompute, redraw); **USER_KEY2** and **USER_KEY3** page up and down through the occupied pages.
+- **Physical buttons** (mapped per the board's published USER_KEY spec): **USER_KEY1** triggers a manual refresh (re-fetch the bulletin, recompute, redraw), or saves a screenshot to microSD when held; **USER_KEY2** and **USER_KEY3** page up and down through the occupied pages.
+- **Screenshot to microSD**: hold **USER_KEY1** for about a second to save the current screen as a 24-bit BMP under `/screenshots` on the card. Files are auto-numbered so captures never overwrite each other, and the card is only accessed when you take a shot.
 - **Next-pass polar plot** per satellite: the pass ground track in blue, a green dot where the satellite rises (AOS), a red dot where it sets (LOS), and a red marker at the highest point. North is up; the horizon is the outer circle, the zenith is the center, and a soft yellow fill marks the high-elevation (above 45°) zone.
 - **Pass details** per satellite: AOS time and rise azimuth (green), LOS time and set azimuth (red), the maximum elevation, and the pass date. A cell whose pass is happening right now shows a red **NOW** badge in place of the date.
 - **Full six-color display** with a clean anti-aliased typeface. The text uses the GNU FreeSans font (FreeSansBold for satellite names) rather than the blocky built-in font. The SPECTRA 6 inks are used semantically: green = rise/AOS, red = set/LOS and peak, blue = ground track and headings, yellow = the good-elevation zone. The satellite name and the max-elevation figure are colored by pass quality (green = marginal, blue = good, red = excellent), so you can judge each pass at a glance.
@@ -32,9 +33,17 @@ The three physical buttons control refresh and paging (see below); no external w
 
 All three buttons are mapped per the board's published USER_KEY specification:
 
-- **USER_KEY1** — manual refresh: re-fetch the AMSAT bulletin, recompute all passes, and redraw.
+- **USER_KEY1** — manual refresh: re-fetch the AMSAT bulletin, recompute all passes, and redraw. **Hold it for ~1 second** to instead save a screenshot of the current screen to the microSD card (see below).
 - **USER_KEY2** — page up: show the previous occupied page.
 - **USER_KEY3** — page down: show the next occupied page.
+
+A short press and a long press of USER_KEY1 are distinguished by an 800 ms hold threshold, so a normal tap refreshes and only a deliberate hold triggers a screenshot.
+
+### Screenshots
+
+Holding USER_KEY1 captures the current framebuffer and writes it to the microSD card as a 24-bit uncompressed BMP at `/screenshots/shotNNNN.bmp`, where `NNNN` is the next free number (so successive captures don't overwrite each other). The footer briefly shows "Screenshot saved" on success, or "Screenshot failed (no SD?)" if the card couldn't be written. At 400×600 each file is about 720 KB.
+
+The card is initialised the first time you take a screenshot and is otherwise never touched, so running without a card has no effect on normal operation. This is separate from the optional LittleFS bulletin cache — the two use different storage. If screenshots fail, check that a FAT-formatted microSD card is inserted and that the SD SPI pins defined near the top of the sketch (`SD_SPI_CS_PIN` etc., defaulting to the published M5PaperS3 pinout) match your unit.
 
 The button-to-`M5.Btn` mapping is defined near the top of the sketch (`BTN_REFRESH`, `BTN_PAGE_UP`, `BTN_PAGE_DN`). If a future board revision changes the assignment, swap those three defines.
 
@@ -98,9 +107,11 @@ Install through the Arduino Library Manager (or PlatformIO `lib_deps`):
 - **Sgp4** — the SGP4 orbital propagator (Hopkins' Arduino port).
 - **FastLED** — drives the two onboard RGB LEDs for pass alerts (M5Unified does not control the RGB LEDs itself).
 
-`WiFi`, `WebServer`, `HTTPClient`, `Preferences`, and `LittleFS` ship with the ESP32 core.
+`WiFi`, `WebServer`, `HTTPClient`, `Preferences`, `LittleFS`, `SPI`, and `SD` ship with the ESP32 core (the latter two are used for the screenshot feature).
 
 > **LED data pin:** the sketch defines `LED_DATA_PIN` near the top (default 21). RGB-LED wiring varies between board revisions, so check this against your unit's GPIO map. If it's wrong, only the LED alerts are affected — the tones and the rest of the app still work.
+
+> **microSD pins:** the SD SPI pins (`SD_SPI_CS_PIN`, `SD_SPI_SCK_PIN`, `SD_SPI_MOSI_PIN`, `SD_SPI_MISO_PIN`) are defined near the top and default to the published M5PaperS3 pinout (47/39/38/40). They are used only for the screenshot feature; if screenshots report no card, verify these against your unit's pinout.
 
 ### Flashing
 
@@ -122,7 +133,7 @@ All of these are changeable from the web page; your choices are saved automatica
 ## Notes and limitations
 
 - **Color e-paper is slow and cannot do partial refresh.** Every redraw is a full-panel flash of roughly 15–19 seconds. This is inherent to SPECTRA 6 and is the entire reason the dashboard is event-driven rather than live.
-- **No microSD card is required.** The card slot is left unprobed at startup, and the orbital-data cache uses internal flash (LittleFS). If the flash filesystem can't be mounted the device still runs — it just re-downloads the bulletin each time instead of caching it. To enable caching (so the data survives a reboot without a fresh download), select an Arduino partition scheme that includes a SPIFFS/LittleFS partition. The time of the last successful update is stored separately and persists across reboots either way.
+- **No microSD card is required** for normal operation. The card slot is left unprobed at startup, and the orbital-data cache uses internal flash (LittleFS). If the flash filesystem can't be mounted the device still runs — it just re-downloads the bulletin each time instead of caching it. To enable caching (so the data survives a reboot without a fresh download), select an Arduino partition scheme that includes a SPIFFS/LittleFS partition. The time of the last successful update is stored separately and persists across reboots either way. A microSD card is needed only if you want to use the screenshot feature.
 - **All times are UTC.**
 - A satellite with no pass in the prediction window shows "no pass found"; a satellite whose elements could not be built shows "no orbital data" (usually resolved after the next bulletin download).
 - The battery percentage assumes a single-cell LiPo (3.4 V empty, 4.2 V full); if your board's power reading differs, the percentage may need calibration.

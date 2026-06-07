@@ -16,11 +16,11 @@ Color SPECTRA 6 e-paper takes roughly 15–19 seconds to refresh and **cannot do
 - **Pass details** per satellite: AOS time and rise azimuth (green), LOS time and set azimuth (red), the maximum elevation, and the pass date. A cell whose pass is happening right now shows a red **NOW** badge in place of the date.
 - **Full six-color display** with a clean anti-aliased typeface. The text uses the GNU FreeSans font (FreeSansBold for satellite names) rather than the blocky built-in font. The SPECTRA 6 inks are used semantically: green = rise/AOS, red = set/LOS and peak, blue = ground track and headings, yellow = the good-elevation zone. The satellite name and the max-elevation figure are colored by pass quality (green = marginal, blue = good, red = excellent), so you can judge each pass at a glance.
 - **Event-driven refresh**: the panel redraws only when a pass on the *currently displayed* page ends (rolling that cell forward to its next pass), when you switch pages, when you press the refresh button, when you save new configuration, and once a day for fresh orbital data. A pass ending on the page you're not viewing updates silently — no wasteful refresh — and while a pass is in progress its cell stays on screen.
-- **Wi-Fi-only configuration**: a built-in web page with up to twenty dropdowns (grouped under five page headings) populated from the AMSAT bulletin satellite list, plus station location fields (lat/lon, altitude, or a Maidenhead grid). Each dropdown has a **(blank)** choice, so you're never forced to assign a satellite to a slot.
+- **Wi-Fi-only configuration**: a built-in web page with up to twenty dropdowns (grouped under five page headings) populated from the AMSAT bulletin satellite list, plus station location fields (lat/lon, altitude, or a Maidenhead grid) and toggles to enable or disable LED and sound alerts independently. Each dropdown has a **(blank)** choice, so you're never forced to assign a satellite to a slot.
 - **Orbital data over Wi-Fi** from the AMSAT daily bulletin, rebuilt into SGP4 elements on-device, with an optional offline cache (internal flash) so passes keep computing without a connection when a filesystem partition is available.
 - **RTC-backed UTC timekeeping** (RX8130CE) for accurate pass prediction immediately on power-up, even before Wi-Fi connects. The time is used internally only — it isn't shown on screen, since the panel refreshes far too infrequently for a clock to stay accurate.
 - **Status footer** showing the age of the orbital data as "GP data: MMM DD HH:MM UTC" (the time of the last successful bulletin update), so you can see at a glance how current the predictions are.
-- **Pass alerts (LED + sound) for every configured satellite.** The two onboard RGB LEDs hold a steady color showing the current phase of the nearest pass across *all* tracked satellites (every page, not just the one on screen), and the speaker plays a short tone at each transition. The phases are: amber from 5 minutes before AOS, orange from 1 minute before AOS, green for the whole pass (AOS to LOS), and red for 30 seconds after LOS, then off. A distinct tone marks each boundary (two low beeps at T-5, three mid beeps at T-1, a rising two-tone at AOS, a falling two-tone at LOS). The LED shows the most urgent phase across all satellites (in progress beats imminent beats upcoming beats just-ended), so you're alerted to a pass even when it's on a page you aren't viewing.
+- **Pass alerts (LED + sound) for every configured satellite**, independently toggleable from the web config. The two onboard RGB LEDs hold a steady color showing the current phase of the nearest pass across *all* tracked satellites (every page, not just the one on screen), and the speaker plays a short tone at each transition. The phases are: amber from 5 minutes before AOS, orange from 1 minute before AOS, green for the whole pass (AOS to LOS), and red for 30 seconds after LOS, then off. A distinct tone marks each boundary (two low beeps at T-5, three mid beeps at T-1, a rising two-tone at AOS, a falling two-tone at LOS). The LED shows the most urgent phase across all satellites (in progress beats imminent beats upcoming beats just-ended), so you're alerted to a pass even when it's on a page you aren't viewing. Either or both outputs can be turned off in the web config; the setting persists across reboots.
 
 ## Hardware
 
@@ -30,11 +30,13 @@ The three physical buttons control refresh and paging (see below); no external w
 
 ## Buttons
 
-- **Top button** — manual refresh: re-fetch the AMSAT bulletin, recompute all passes, and redraw.
-- **Up button** — show the previous page (satellites 1–4).
-- **Down button** — show the next page (satellites 5–8).
+All three buttons are mapped per the board's published USER_KEY specification:
 
-The button-to-position mapping is defined near the top of the sketch (`BTN_REFRESH`, `BTN_PAGE_UP`, `BTN_PAGE_DN` → `M5.BtnA/B/C`). If your unit's physical layout differs, swap those defines.
+- **USER_KEY1** — manual refresh: re-fetch the AMSAT bulletin, recompute all passes, and redraw.
+- **USER_KEY2** — page up: show the previous occupied page.
+- **USER_KEY3** — page down: show the next occupied page.
+
+The button-to-`M5.Btn` mapping is defined near the top of the sketch (`BTN_REFRESH`, `BTN_PAGE_UP`, `BTN_PAGE_DN`). If a future board revision changes the assignment, swap those three defines.
 
 ## Display orientation
 
@@ -64,7 +66,7 @@ The polar plot maps each sampled point of the pass to a radius of `(90 − eleva
 
 1. Flash and power on. On first boot the device starts a Wi-Fi access point named **`PaperSatColor-Setup`** (this is WiFiManager's captive portal). Join it from a phone or laptop and enter your network credentials.
 2. Once the device is on your network, the header at the top of the screen shows **Config:** followed by its **IP address**.
-3. Browse to that IP address. The setup page has up to twenty dropdowns, grouped under headings Page 1 through Page 5 (four slots each), populated from the AMSAT bulletin. Pick a satellite for each slot you want to use and leave the rest on **(blank)**. Blank slots stay empty and any page left entirely blank won't be shown.
+3. Browse to that IP address. The setup page has up to twenty dropdowns, grouped under headings Page 1 through Page 5 (four slots each), populated from the AMSAT bulletin. Pick a satellite for each slot you want to use and leave the rest on **(blank)**. Blank slots stay empty and any page left entirely blank won't be shown. An **Alerts** section at the bottom lets you enable or disable LED and sound alerts independently.
 4. Set your station location: latitude/longitude and altitude, or just a Maidenhead grid square (which overrides lat/lon). If you leave the defaults, the device will try to estimate your location from your public IP on first run.
 5. Press **Save & Refresh**. The device stores your choices, fetches fresh orbital elements for the chosen satellites, recomputes their next passes, and redraws once (about 20 seconds on this panel).
 
@@ -72,9 +74,9 @@ Your configuration persists across reboots.
 
 ## How it works
 
-On boot the device connects to Wi-Fi, seeds its clock from the RTC, syncs time over NTP, and downloads the AMSAT daily bulletin (`daily-bulletin.json`). It reconstructs standard two-line elements for the four chosen satellites from the bulletin's discrete orbital-element fields, then runs the SGP4 propagator to find each satellite's next pass — capturing the AOS time and rise azimuth, the LOS time and set azimuth, the peak elevation, and a set of points along the pass for the polar plot. The bulletin is cached to on-board flash so the tracker keeps working offline using the last known elements, and the time of the last successful update is remembered across reboots.
+On boot the device connects to Wi-Fi, seeds its clock from the RTC, syncs time over NTP, and downloads the AMSAT daily bulletin (`daily-bulletin.json`). It reconstructs standard two-line elements for the configured satellites from the bulletin's discrete orbital-element fields, then runs the SGP4 propagator to find each satellite's next pass — capturing the AOS time and rise azimuth, the LOS time and set azimuth, the peak elevation, and a set of points along the pass for the polar plot. The bulletin is cached to on-board flash so the tracker keeps working offline using the last known elements, and the time of the last successful update is remembered across reboots.
 
-The main loop is almost idle: it services the configuration web server, drives the alert LEDs and tones, and watches a single scheduled time — the soonest pass *end* (LOS) across all four cells. While a pass is in progress its cell stays on screen; only once the pass concludes (and its post-pass alert window has elapsed) does the device roll every cell forward to its next pass and redraw once, so the slow panel never refreshes mid-pass and never re-shows a pass that already finished. A daily refresh also runs to pull the latest bulletin. Nothing else triggers a redraw, which keeps the panel quiet and the power draw low.
+The main loop is almost idle: it services the configuration web server, drives the alert LEDs and tones (when enabled), and watches the per-satellite scheduled roll times — each satellite has its own LOS+margin timestamp after which it recomputes its next pass. While a pass is in progress its cell stays on screen; only once the pass concludes (and its post-pass alert window has elapsed) does the device compute the next pass for that satellite and, if it's on the current page, redraw once — so the slow panel never refreshes mid-pass and never re-shows a pass that already finished. A daily refresh also runs to pull the latest bulletin. Nothing else triggers a redraw, which keeps the panel quiet and the power draw low.
 
 On startup, before any new download completes, the device uses its saved location, the RTC clock, and the last cached bulletin so it can show passes immediately; the footer reports the date of that last update. The RTC is battery-backed, and once NTP provides a more precise time it is written back so the correct time survives a full power-off.
 
@@ -112,6 +114,8 @@ Connect the board over USB-C and flash from the Arduino IDE (or `pio run -t uplo
 | Location | 38.8626, -77.0562 (Washington, DC area), auto-located on first run |
 | Orbital data source | AMSAT daily bulletin |
 | Time base | UTC (NTP via `pool.ntp.org`, RTC-backed) |
+| LED alerts | Enabled |
+| Sound alerts | Enabled |
 
 All of these are changeable from the web page; your choices are saved automatically.
 

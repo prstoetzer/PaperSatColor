@@ -74,6 +74,12 @@ double qth_lat = 38.8626;
 double qth_lon = -77.0562;
 double qth_alt = 10.0;
 
+// User-toggleable alert outputs (set from the web config; default on). When
+// off, the corresponding output stays silent/dark but pass computation and the
+// rest of the dashboard are unaffected.
+bool ledAlertsEnabled   = true;
+bool soundAlertsEnabled = true;
+
 #define PER_PAGE    4     // 2x2 grid per page
 #define NUM_PAGES   5     // up to five pages
 #define NUM_TRACKED (PER_PAGE * NUM_PAGES)   // up to 20 satellites total
@@ -292,6 +298,8 @@ void loadConfig() {
   qth_lat = prefs.getDouble("lat", qth_lat);
   qth_lon = prefs.getDouble("lon", qth_lon);
   qth_alt = prefs.getDouble("alt", qth_alt);
+  ledAlertsEnabled   = prefs.getULong("ledAlerts", 1) != 0;
+  soundAlertsEnabled = prefs.getULong("sndAlerts", 1) != 0;
   lastTLETime = prefs.getULong("lastTLE", 0);
   for (int i = 0; i < NUM_TRACKED; i++) {
     char kn[8], km[8], k1[8], k2[8];
@@ -313,6 +321,8 @@ void saveConfig() {
   prefs.putDouble("lat", qth_lat);
   prefs.putDouble("lon", qth_lon);
   prefs.putDouble("alt", qth_alt);
+  prefs.putULong("ledAlerts", ledAlertsEnabled   ? 1 : 0);
+  prefs.putULong("sndAlerts", soundAlertsEnabled ? 1 : 0);
   for (int i = 0; i < NUM_TRACKED; i++) {
     char kn[8], km[8];
     snprintf(kn,sizeof(kn),"n%d",i); snprintf(km,sizeof(km),"m%d",i);
@@ -787,6 +797,7 @@ static void ledSet(const CRGB& c) {
 
 // One-shot tone signature per boundary (distinct so you can tell them apart).
 void fireAlert(AlertKind k, const char* satName) {
+  if (!soundAlertsEnabled) return;          // audio alerts disabled in config
   M5.Speaker.setVolume(ALERT_VOLUME);
   switch (k) {
     case AL_T5:                                   // 5 min out: two low beeps
@@ -812,6 +823,7 @@ void fireAlert(AlertKind k, const char* satName) {
 // Priority: in-progress (green) > imminent (orange) > upcoming (amber) >
 // just-ended (red) > off. Returns nothing; updates the LEDs directly.
 void updateLedPhase() {
+  if (!ledAlertsEnabled) { ledSet(CRGB::Black); return; }   // LED alerts disabled
   time_t now = time(nullptr);
   if (now < TLE_TIME_VALID_THRESHOLD) { ledSet(CRGB::Black); return; }
 
@@ -1231,6 +1243,17 @@ void handleRoot() {
   html += "<p><small>Or enter a Maidenhead grid (overrides lat/lon if 4+ chars):</small>";
   html += "<input name=grid placeholder='e.g. FM18lv'></p>";
 
+  // Alert toggles. A hidden marker lets the save handler tell "this form was
+  // submitted" (so an unchecked box = off) from "field absent".
+  html += "<h2>Alerts</h2>";
+  html += "<input type=hidden name=alertsform value=1>";
+  html += "<label style='font-weight:normal'><input type=checkbox name=led value=1";
+  if (ledAlertsEnabled) html += " checked";
+  html += "> Enable LED alerts</label>";
+  html += "<label style='font-weight:normal'><input type=checkbox name=snd value=1";
+  if (soundAlertsEnabled) html += " checked";
+  html += "> Enable sound alerts</label>";
+
   html += "<button type=submit>Save &amp; Refresh</button>";
   html += "</form></body></html>";
   server.send(200, "text/html", html);
@@ -1274,6 +1297,14 @@ void handleSave() {
     if (server.hasArg("lon")) qth_lon = server.arg("lon").toDouble();
   }
   if (server.hasArg("alt")) qth_alt = server.arg("alt").toDouble();
+
+  // Alert toggles. The hidden "alertsform" marker is always present when this
+  // form is submitted; an unchecked checkbox simply isn't sent, so absence of
+  // "led"/"snd" (with the marker present) means the user turned it off.
+  if (server.hasArg("alertsform")) {
+    ledAlertsEnabled   = server.hasArg("led");
+    soundAlertsEnabled = server.hasArg("snd");
+  }
 
   saveConfig();
 

@@ -2,7 +2,7 @@
 
 An **up-to-20-satellite next-pass dashboard** for the **M5Paper Color** (ESP32-S3, 4" SPECTRA 6 color e-paper, 600×400). It tracks up to twenty satellites across up to five pages of four, each shown in a 2×2 grid; each cell is a polar (azimuth/elevation) plot of that satellite's next pass with the AOS/LOS times and azimuths and the maximum elevation. You don't have to fill every slot: any slot you leave blank is simply left empty, and any page with no satellites at all is hidden — so if you only configure six satellites you get two pages, not five. It is built for a slow color e-ink panel — the display redraws only after a pass on the currently shown page has concluded (so the next pass can take its place), when you switch pages, when you manually refresh, or when you change the configuration.
 
-! [PaperSatColor Screenshot] (PaperSatColor_Screenshot.jpg)
+![PaperSatColor Screenshot](PaperSatColor_Screenshot.jpg)
 
 All configuration is done over Wi-Fi through a small web page the device serves; there are no on-device menus or buttons to operate.
 

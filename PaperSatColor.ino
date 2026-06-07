@@ -47,13 +47,16 @@
 #define SCR_H 600
 
 // ---------------- microSD (for screenshots) ----------------
-// SPI pins per the M5PaperS3 published specification. VERIFY against your unit's
-// pinout if the card isn't detected. The card is initialised lazily on the first
-// screenshot, so a missing card costs nothing during normal operation.
+// SPI pins per the M5Stack PaperColor (C151) published pinout. The SD shares the
+// display's SPI CLK (G15) and MOSI (G13); MISO is G14 and the card has its own
+// chip-select on G47. Note the microSD power/detect are gated through the M5PM1
+// PMIC (PY_SD_PWR_EN / PY_SD_DET_EN); M5.begin() is expected to bring these up.
+// The card is initialised lazily on the first screenshot, so a missing card
+// costs nothing during normal operation.
 #define SD_SPI_CS_PIN   47
-#define SD_SPI_SCK_PIN  39
-#define SD_SPI_MOSI_PIN 38
-#define SD_SPI_MISO_PIN 40
+#define SD_SPI_SCK_PIN  15
+#define SD_SPI_MOSI_PIN 13
+#define SD_SPI_MISO_PIN 14
 bool sdReady = false;   // true once SD.begin() has succeeded at least once
 
 // Spectra 6 gives us six inks: black, white, red, yellow, blue, green. We use
@@ -102,9 +105,10 @@ bool soundAlertsEnabled = true;
 // every tracked pass: 5 minutes before AOS, 1 minute before AOS, at AOS (rise),
 // and at LOS (set). Each alert fires exactly once per pass.
 //
-// LEDs use FastLED (M5Unified doesn't drive them). VERIFY the data pin against
-// the M5Paper Color GPIO map - this is the documented default but boards vary.
-#define LED_DATA_PIN  21      // <-- confirm on your unit's pinout
+// LEDs use FastLED (M5Unified doesn't drive them). G21 is the RGB data line per
+// the PaperColor (C151) published pinmap. The LED power rail is gated through
+// the M5PM1 PMIC (PY_RGB_PWR_EN), which M5.begin() is expected to enable.
+#define LED_DATA_PIN  21      // RGB data line (G21 per PaperColor pinmap)
 #define NUM_LEDS      2
 #define LED_BRIGHTNESS 40     // 0-255; keep modest (heat) and battery-friendly
 CRGB leds[NUM_LEDS];

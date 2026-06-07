@@ -43,7 +43,7 @@ A short press and a long press of USER_KEY1 are distinguished by an 800 ms hold 
 
 Holding USER_KEY1 captures the current framebuffer and writes it to the microSD card as a 24-bit uncompressed BMP at `/screenshots/shotNNNN.bmp`, where `NNNN` is the next free number (so successive captures don't overwrite each other). The footer briefly shows "Screenshot saved" on success, or "Screenshot failed (no SD?)" if the card couldn't be written. At 400×600 each file is about 720 KB.
 
-The card is initialised the first time you take a screenshot and is otherwise never touched, so running without a card has no effect on normal operation. This is separate from the optional LittleFS bulletin cache — the two use different storage. If screenshots fail, check that a FAT-formatted microSD card is inserted and that the SD SPI pins defined near the top of the sketch (`SD_SPI_CS_PIN` etc., defaulting to the published M5PaperS3 pinout) match your unit.
+The card is initialised the first time you take a screenshot and is otherwise never touched, so running without a card has no effect on normal operation. This is separate from the optional LittleFS bulletin cache — the two use different storage. If screenshots fail, check that a FAT-formatted microSD card is inserted; the SD SPI pins are set from the official PaperColor pinout near the top of the sketch.
 
 The button-to-`M5.Btn` mapping is defined near the top of the sketch (`BTN_REFRESH`, `BTN_PAGE_UP`, `BTN_PAGE_DN`). If a future board revision changes the assignment, swap those three defines.
 
@@ -111,7 +111,7 @@ Install through the Arduino Library Manager (or PlatformIO `lib_deps`):
 
 > **LED data pin:** the sketch defines `LED_DATA_PIN` near the top (default 21). RGB-LED wiring varies between board revisions, so check this against your unit's GPIO map. If it's wrong, only the LED alerts are affected — the tones and the rest of the app still work.
 
-> **microSD pins:** the SD SPI pins (`SD_SPI_CS_PIN`, `SD_SPI_SCK_PIN`, `SD_SPI_MOSI_PIN`, `SD_SPI_MISO_PIN`) are defined near the top and default to the published M5PaperS3 pinout (47/39/38/40). They are used only for the screenshot feature; if screenshots report no card, verify these against your unit's pinout.
+> **microSD pins:** the SD SPI pins (`SD_SPI_CS_PIN`, `SD_SPI_SCK_PIN`, `SD_SPI_MOSI_PIN`, `SD_SPI_MISO_PIN`) are defined near the top and set from the official M5Stack PaperColor pinout (CS G47, SCK G15, MOSI G13, MISO G14). The card shares the display's SPI clock and MOSI lines. Its power and card-detect are gated through the M5PM1 power-management chip, which `M5.begin()` is expected to bring up.
 
 ### Flashing
 

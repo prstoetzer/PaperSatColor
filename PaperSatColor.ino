@@ -1397,24 +1397,26 @@ bool saveScreenshot() {
   f.write(ih, 40);
 
   // ---- Pixel rows, bottom-up ----
-  // Read one display row at a time into an RGB888 buffer, repack as BGR with
-  // padding. readRect with an rgb888 buffer gives 3 bytes/pixel as R,G,B.
-  uint8_t *rgb = (uint8_t*)malloc(W * 3);
-  uint8_t *row = (uint8_t*)malloc(rowBytes);
-  if (!rgb || !row) { if (rgb) free(rgb); if (row) free(row); f.close(); return false; }
+  // Read one display row at a time with readRectRGB(), which returns RGBColor
+  // structs in unambiguous RGB888 (.r/.g/.b members). We index those members
+  // explicitly rather than relying on the raw byte order of readRect(), whose
+  // byte layout on this panel is reversed (the cause of the swapped colors).
+  RGBColor *px  = (RGBColor*)malloc(W * sizeof(RGBColor));
+  uint8_t  *row = (uint8_t*)malloc(rowBytes);
+  if (!px || !row) { if (px) free(px); if (row) free(row); f.close(); return false; }
   memset(row, 0, rowBytes);
 
   bool ok = true;
   for (int y = H - 1; y >= 0; y--) {            // BMP is bottom-up
-    M5.Display.readRect(0, y, W, 1, (lgfx::rgb888_t*)rgb);
+    M5.Display.readRectRGB(0, y, W, 1, px);
     for (int x = 0; x < W; x++) {
-      uint8_t r = rgb[x*3 + 0], g = rgb[x*3 + 1], b = rgb[x*3 + 2];
-      row[x*3 + 0] = b; row[x*3 + 1] = g; row[x*3 + 2] = r;   // BGR
+      // BMP stores pixels as B,G,R.
+      row[x*3 + 0] = px[x].b; row[x*3 + 1] = px[x].g; row[x*3 + 2] = px[x].r;
     }
     if (f.write(row, rowBytes) != (size_t)rowBytes) { ok = false; break; }
   }
 
-  free(rgb); free(row);
+  free(px); free(row);
   f.close();
   return ok;
 }
